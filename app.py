@@ -19,88 +19,35 @@ def telegram(method, data=None):
         timeout=20
     )
 
-    print("Telegram API:", method, response.status_code, response.text)
+    print(
+        "Telegram API:",
+        method,
+        response.status_code,
+        response.text
+    )
 
     return response.json()
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot online - VERSAO 3!"
+    return "Bot online - VERSAO 4!"
 
 
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
     data = request.get_json(silent=True) or {}
 
-    print("ATUALIZACAO RECEBIDA:", data)
-
     if "message" in data:
-        message = data["message"]
-
-        chat = message.get("chat", {})
-        chat_id = chat.get("id")
-
-        text = message.get("text", "")
-
-        print("CHAT ID:", chat_id)
-        print("TEXTO:", text)
-
-        if text.strip() == "/start":
-            telegram(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": (
-                        "👋 Bem-vindo ao ACESSO PREMIUM!\n\n"
-                        "🔥 ACESSO PREMIUM\n"
-                        "💰 R$ 24,90\n\n"
-                        "Clique abaixo para comprar:"
-                    ),
-                    "reply_markup": {
-                        "inline_keyboard": [
-                            [
-                                {
-                                    "text": "💳 COMPRAR — R$ 24,90",
-                                    "callback_data": "comprar"
-                                }
-                            ]
-                        ]
-                    }
-                }
-            )
-
-    if "callback_query" in data:
-        callback = data["callback_query"]
-
-        callback_id = callback.get("id")
-        callback_data = callback.get("data")
-
-        message = callback.get("message", {})
-        chat = message.get("chat", {})
-        chat_id = chat.get("id")
-
-        print("BOTAO:", callback_data)
+        chat_id = data["message"]["chat"]["id"]
 
         telegram(
-            "answerCallbackQuery",
+            "sendMessage",
             {
-                "callback_query_id": callback_id
+                "chat_id": chat_id,
+                "text": "✅ TESTE FUNCIONOU! O bot recebeu sua mensagem."
             }
         )
-
-        if callback_data == "comprar":
-            telegram(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": (
-                        "🛒 ACESSO PREMIUM\n\n"
-                        "💰 Valor: R$ 24,90\n\n"
-                        "PIX será gerado em seguida."
-                    )
-                }
-            )
 
     return jsonify({"ok": True})
 
