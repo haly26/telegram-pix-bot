@@ -31,14 +31,16 @@ def home():
 
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
-    data = request.get_json(silent=True) or {}
+    data = 
+request.get_json(silent=True) or 
+{}
 
 print("ATUALIZAÇÃO RECEBIDA:", data)
     data = request.get_json(silent=True) or {}
 
     print("================================")
     print("ATUALIZAÇÃO RECEBIDA:")
-    print(data)
+    rint(data)
     print("================================")
 
     # Mensagem normal
