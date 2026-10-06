@@ -26,26 +26,16 @@ def telegram(method, data=None):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot online - VERSAO 2!"
+    return "Bot online - VERSAO 3!"
 
 
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
-    data = 
-request.get_json(silent=True) or 
-{}
-
-print("ATUALIZAÇÃO RECEBIDA:", data)
     data = request.get_json(silent=True) or {}
 
-    print("================================")
-    print("ATUALIZAÇÃO RECEBIDA:")
-    rint(data)
-    print("================================")
+    print("ATUALIZACAO RECEBIDA:", data)
 
-    # Mensagem normal
     if "message" in data:
-
         message = data["message"]
 
         chat = message.get("chat", {})
@@ -57,7 +47,6 @@ print("ATUALIZAÇÃO RECEBIDA:", data)
         print("TEXTO:", text)
 
         if text.strip() == "/start":
-
             telegram(
                 "sendMessage",
                 {
@@ -81,20 +70,17 @@ print("ATUALIZAÇÃO RECEBIDA:", data)
                 }
             )
 
-    # Clique no botão
     if "callback_query" in data:
-
         callback = data["callback_query"]
 
         callback_id = callback.get("id")
+        callback_data = callback.get("data")
 
         message = callback.get("message", {})
         chat = message.get("chat", {})
         chat_id = chat.get("id")
 
-        callback_data = callback.get("data")
-
-        print("BOTÃO:", callback_data)
+        print("BOTAO:", callback_data)
 
         telegram(
             "answerCallbackQuery",
@@ -104,7 +90,6 @@ print("ATUALIZAÇÃO RECEBIDA:", data)
         )
 
         if callback_data == "comprar":
-
             telegram(
                 "sendMessage",
                 {
@@ -121,7 +106,6 @@ print("ATUALIZAÇÃO RECEBIDA:", data)
 
 
 if __name__ == "__main__":
-
     port = int(os.environ.get("PORT", 10000))
 
     app.run(
