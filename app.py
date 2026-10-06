@@ -31,7 +31,9 @@ def home():
 
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
-    
+    data = request.get_json(silent=True) or {}
+
+print("ATUALIZAÇÃO RECEBIDA:", data)
     data = request.get_json(silent=True) or {}
 
     print("================================")
