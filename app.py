@@ -31,7 +31,7 @@ def home():
 
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
-    return "TESTE TELEGRAM", 200
+    return "TESTE TELEGRAM", 201
     data = request.get_json(silent=True) or {}
 
     print("================================")
