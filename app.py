@@ -26,7 +26,7 @@ def telegram(method, data=None):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot online!"
+    return "Bot online - VERSAO 2!"
 
 
 @app.route("/telegram", methods=["POST"])
