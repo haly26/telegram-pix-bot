@@ -7,6 +7,7 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ASAAS_API_KEY = os.environ.get("ASAAS_API_KEY")
+ASAAS_WEBHOOK_TOKEN = os.environ.get("ASAAS_WEBHOOK_TOKEN")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 ASAAS_API = "https://api-sandbox.asaas.com/v3"
@@ -16,8 +17,12 @@ PRODUCT_VALUE = 24.90
 # Nome EXATO do cliente criado no Asaas Sandbox
 ASAAS_CUSTOMER_NAME = "Teste bot pix"
 
+# ID do canal privado
+CHANNEL_ID = "-1004395341778"
+
 
 def telegram(method, data):
+
     url = f"{TELEGRAM_API}/{method}"
 
     response = requests.post(
@@ -37,6 +42,7 @@ def telegram(method, data):
 
 
 def asaas_headers():
+
     return {
         "access_token": ASAAS_API_KEY,
         "Content-Type": "application/json",
@@ -65,6 +71,7 @@ def encontrar_cliente():
     )
 
     if not response.ok:
+
         return None
 
     data = response.json()
@@ -87,11 +94,12 @@ def encontrar_cliente():
     return cliente.get("id")
 
 
-def criar_cobranca_pix():
+def criar_cobranca_pix(chat_id):
 
     customer_id = encontrar_cliente()
 
     if not customer_id:
+
         return None
 
     print("CRIANDO COBRANÇA ASAAS...")
@@ -101,7 +109,10 @@ def criar_cobranca_pix():
         "billingType": "PIX",
         "value": PRODUCT_VALUE,
         "description": "Acesso Premium",
-        "dueDate": date.today().isoformat()
+        "dueDate": date.today().isoformat(),
+
+        # Guarda o usuário Telegram relacionado à cobrança
+        "externalReference": str(chat_id)
     }
 
     response = requests.post(
@@ -118,6 +129,7 @@ def criar_cobranca_pix():
     )
 
     if not response.ok:
+
         return None
 
     return response.json()
@@ -140,9 +152,48 @@ def obter_pix(payment_id):
     )
 
     if not response.ok:
+
         return None
 
     return response.json()
+
+
+def criar_link_convite():
+
+    print("CRIANDO LINK DE CONVITE...")
+
+    response = telegram(
+        "createChatInviteLink",
+        {
+            "chat_id": CHANNEL_ID,
+
+            # Link pode ser usado somente uma vez
+            "member_limit": 1,
+
+            # Nome interno para identificação
+            "name": "Compra Premium"
+        }
+    )
+
+    if not response.get("ok"):
+
+        print(
+            "ERRO AO CRIAR LINK:",
+            response
+        )
+
+        return None
+
+    resultado = response.get("result", {})
+
+    invite_link = resultado.get("invite_link")
+
+    print(
+        "LINK DE CONVITE CRIADO:",
+        invite_link
+    )
+
+    return invite_link
 
 
 @app.route("/", methods=["GET"])
@@ -185,12 +236,14 @@ def telegram_webhook():
                 "sendMessage",
                 {
                     "chat_id": chat_id,
+
                     "text": (
                         "🔥 ACESSO PREMIUM\n\n"
                         "Tenha acesso ao nosso conteúdo exclusivo.\n\n"
                         "💰 Valor: R$ 24,90\n\n"
                         "Clique abaixo para realizar o pagamento:"
                     ),
+
                     "reply_markup": keyboard
                 }
             )
@@ -214,7 +267,7 @@ def telegram_webhook():
 
         if callback_data == "comprar":
 
-            cobranca = criar_cobranca_pix()
+            cobranca = criar_cobranca_pix(chat_id)
 
             if cobranca is None:
 
@@ -222,6 +275,7 @@ def telegram_webhook():
                     "sendMessage",
                     {
                         "chat_id": chat_id,
+
                         "text": (
                             "❌ Não foi possível gerar o PIX.\n\n"
                             "Tente novamente em alguns instantes."
@@ -233,6 +287,11 @@ def telegram_webhook():
 
                 payment_id = cobranca.get("id")
 
+                print(
+                    "PAGAMENTO CRIADO:",
+                    payment_id
+                )
+
                 pix = obter_pix(payment_id)
 
                 if pix is None:
@@ -241,6 +300,7 @@ def telegram_webhook():
                         "sendMessage",
                         {
                             "chat_id": chat_id,
+
                             "text": (
                                 "❌ A cobrança foi criada, "
                                 "mas não conseguimos obter o PIX."
@@ -259,7 +319,7 @@ def telegram_webhook():
                         "📱 PIX COPIA E COLA:\n\n"
                         f"{qr_code}\n\n"
                         "Após realizar o pagamento, "
-                        "aguarde a confirmação."
+                        "aguarde a confirmação automática."
                     )
 
                     telegram(
@@ -276,11 +336,96 @@ def telegram_webhook():
 @app.route("/asaas", methods=["POST"])
 def asaas_webhook():
 
-    data = request.get_json(silent=True) or {}
-
     print("========== WEBHOOK ASAAS ==========")
 
-    print("DADOS:", data)
+    # Verifica o token de segurança enviado pelo Asaas
+    token_recebido = request.headers.get("asaas-access-token")
+
+    if not ASAAS_WEBHOOK_TOKEN:
+
+        print("ERRO: ASAAS_WEBHOOK_TOKEN NÃO CONFIGURADO")
+
+        return jsonify({"ok": False}), 500
+
+    if token_recebido != ASAAS_WEBHOOK_TOKEN:
+
+        print("WEBHOOK ASAAS: TOKEN INVÁLIDO")
+
+        return jsonify({"ok": False}), 401
+
+    data = request.get_json(silent=True) or {}
+
+    print(
+        "DADOS WEBHOOK ASAAS:",
+        data
+    )
+
+    evento = data.get("event")
+
+    print(
+        "EVENTO ASAAS:",
+        evento
+    )
+
+    # Só libera acesso quando o pagamento foi realmente recebido
+    if evento == "PAYMENT_RECEIVED":
+
+        payment = data.get("payment", {})
+
+        payment_id = payment.get("id")
+
+        telegram_chat_id = payment.get("externalReference")
+
+        print(
+            "PAGAMENTO RECEBIDO:",
+            payment_id
+        )
+
+        print(
+            "TELEGRAM CHAT ID:",
+            telegram_chat_id
+        )
+
+        if not telegram_chat_id:
+
+            print(
+                "ERRO: PAGAMENTO SEM TELEGRAM CHAT ID"
+            )
+
+            return jsonify({"ok": True})
+
+        # Cria um link individual com limite de 1 pessoa
+        invite_link = criar_link_convite()
+
+        if not invite_link:
+
+            print(
+                "ERRO: NÃO FOI POSSÍVEL CRIAR LINK"
+            )
+
+            return jsonify({"ok": True})
+
+        # Envia o link para o comprador
+        telegram(
+            "sendMessage",
+            {
+                "chat_id": int(telegram_chat_id),
+
+                "text": (
+                    "✅ PAGAMENTO CONFIRMADO!\n\n"
+                    "Seu pagamento de R$ 24,90 foi recebido.\n\n"
+                    "🔓 SEU ACESSO PREMIUM:\n\n"
+                    f"{invite_link}\n\n"
+                    "⚠️ Este link é individual e pode ser usado "
+                    "para uma única entrada no canal."
+                )
+            }
+        )
+
+        print(
+            "ACESSO ENVIADO PARA:",
+            telegram_chat_id
+        )
 
     return jsonify({"ok": True})
 
