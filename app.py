@@ -1,21 +1,20 @@
 import os
-import base64
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-PUSHINPAY_TOKEN = os.environ.get("PUSHINPAY_TOKEN")
+ASAAS_API_KEY = os.environ.get("ASAAS_API_KEY")
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-PUSHINPAY_API = "https://api.pushinpay.com.br/api/pix/cashIn"
+ASAAS_API = "https://api-sandbox.asaas.com/v3"
 
-PRODUCT_VALUE = 2490
+PRODUCT_VALUE = 24.90
 
 
 def telegram(method, data):
-
     url = f"{TELEGRAM_API}/{method}"
 
     response = requests.post(
@@ -29,30 +28,56 @@ def telegram(method, data):
     return response.json()
 
 
-def criar_pix():
-
-    headers = {
-        "Authorization": f"Bearer {PUSHINPAY_TOKEN}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+def asaas_headers():
+    return {
+        "access_token": ASAAS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
+
+
+def criar_cobranca_pix():
+    print("CRIANDO COBRANÇA ASAAS...")
 
     payload = {
+        "billingType": "PIX",
         "value": PRODUCT_VALUE,
-        "webhook_url": "https://telegram-pix-bot-hbii.onrender.com/pushinpay",
-        "split_rules": []
+        "description": "Acesso Premium"
     }
 
-    print("CRIANDO PIX...")
-
     response = requests.post(
-        PUSHINPAY_API,
-        headers=headers,
+        f"{ASAAS_API}/payments",
+        headers=asaas_headers(),
         json=payload,
         timeout=30
     )
 
-    print("PUSHINPAY:", response.status_code, response.text)
+    print(
+        "ASAAS CREATE PAYMENT:",
+        response.status_code,
+        response.text
+    )
+
+    if not response.ok:
+        return None
+
+    return response.json()
+
+
+def obter_pix(payment_id):
+    print("BUSCANDO QR CODE PIX...")
+
+    response = requests.get(
+        f"{ASAAS_API}/payments/{payment_id}/pixQrCode",
+        headers=asaas_headers(),
+        timeout=30
+    )
+
+    print(
+        "ASAAS PIX QR CODE:",
+        response.status_code,
+        response.text
+    )
 
     if not response.ok:
         return None
@@ -62,8 +87,7 @@ def criar_pix():
 
 @app.route("/", methods=["GET"])
 def home():
-
-    return "BOT ONLINE - PUSHINPAY"
+    return "BOT ONLINE - ASAAS"
 
 
 @app.route("/telegram", methods=["POST"])
@@ -75,7 +99,10 @@ def telegram_webhook():
 
     print("JSON:", data)
 
-    # Mensagem normal
+    # =========================
+    # MENSAGEM NORMAL
+    # =========================
+
     if "message" in data:
 
         message = data["message"]
@@ -111,7 +138,10 @@ def telegram_webhook():
                 }
             )
 
-    # Clique no botão
+    # =========================
+    # BOTÃO COMPRAR
+    # =========================
+
     if "callback_query" in data:
 
         callback = data["callback_query"]
@@ -131,16 +161,16 @@ def telegram_webhook():
 
         if callback_data == "comprar":
 
-            pix = criar_pix()
+            cobranca = criar_cobranca_pix()
 
-            if pix is None:
+            if cobranca is None:
 
                 telegram(
                     "sendMessage",
                     {
                         "chat_id": chat_id,
                         "text": (
-                            "❌ Não foi possível gerar o PIX agora.\n\n"
+                            "❌ Não foi possível gerar o PIX.\n\n"
                             "Tente novamente em alguns instantes."
                         )
                     }
@@ -148,38 +178,55 @@ def telegram_webhook():
 
             else:
 
-                print("PIX GERADO:", pix)
+                payment_id = cobranca.get("id")
 
-                qr_code = pix.get("qr_code", "")
+                pix = obter_pix(payment_id)
 
-                transaction_id = pix.get("id", "")
+                if pix is None:
 
-                mensagem = (
-                    "💳 PAGAMENTO\n\n"
-                    "Valor: R$ 24,90\n\n"
-                    "PIX copia e cola:\n\n"
-                    f"{qr_code}\n\n"
-                    "Após o pagamento, aguarde a confirmação.\n\n"
-                    f"ID da transação: {transaction_id}"
-                )
+                    telegram(
+                        "sendMessage",
+                        {
+                            "chat_id": chat_id,
+                            "text": (
+                                "❌ A cobrança foi criada, "
+                                "mas não conseguimos obter o PIX."
+                            )
+                        }
+                    )
 
-                telegram(
-                    "sendMessage",
-                    {
-                        "chat_id": chat_id,
-                        "text": mensagem
-                    }
-                )
+                else:
+
+                    qr_code = pix.get("payload", "")
+
+                    mensagem = (
+                        "💳 PAGAMENTO\n\n"
+                        "Produto: ACESSO PREMIUM\n"
+                        "Valor: R$ 24,90\n\n"
+                        "📱 PIX COPIA E COLA:\n\n"
+                        f"{qr_code}\n\n"
+                        "Após realizar o pagamento, "
+                        "aguarde a confirmação."
+                    )
+
+                    telegram(
+                        "sendMessage",
+                        {
+                            "chat_id": chat_id,
+                            "text": mensagem
+                        }
+                    )
 
     return jsonify({"ok": True})
 
 
-@app.route("/pushinpay", methods=["POST"])
-def pushinpay_webhook():
+@app.route("/asaas", methods=["POST"])
+def asaas_webhook():
 
     data = request.get_json(silent=True) or {}
 
-    print("========== WEBHOOK PUSHINPAY ==========")
+    print("========== WEBHOOK ASAAS ==========")
+
     print("DADOS:", data)
 
     return jsonify({"ok": True})
@@ -187,7 +234,12 @@ def pushinpay_webhook():
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
