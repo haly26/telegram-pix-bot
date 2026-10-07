@@ -1,6 +1,7 @@
 import os
 import requests
 from flask import Flask, request, jsonify
+from datetime import date
 
 app = Flask(__name__)
 
@@ -13,7 +14,7 @@ ASAAS_API = "https://api-sandbox.asaas.com/v3"
 PRODUCT_VALUE = 24.90
 
 # Nome EXATO do cliente criado no Asaas Sandbox
-ASAAS_CUSTOMER_NAME = "Teste bot Pix"
+ASAAS_CUSTOMER_NAME = "Teste bot pix"
 
 
 def telegram(method, data):
@@ -44,6 +45,7 @@ def asaas_headers():
 
 
 def encontrar_cliente():
+
     print("PROCURANDO CLIENTE NO ASAAS...")
 
     response = requests.get(
@@ -70,7 +72,9 @@ def encontrar_cliente():
     clientes = data.get("data", [])
 
     if not clientes:
+
         print("CLIENTE NÃO ENCONTRADO")
+
         return None
 
     cliente = clientes[0]
@@ -96,7 +100,8 @@ def criar_cobranca_pix():
         "customer": customer_id,
         "billingType": "PIX",
         "value": PRODUCT_VALUE,
-        "description": "Acesso Premium"
+        "description": "Acesso Premium",
+        "dueDate": date.today().isoformat()
     }
 
     response = requests.post(
@@ -142,6 +147,7 @@ def obter_pix(payment_id):
 
 @app.route("/", methods=["GET"])
 def home():
+
     return "BOT ONLINE - ASAAS"
 
 
