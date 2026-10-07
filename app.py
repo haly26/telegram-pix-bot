@@ -6,12 +6,14 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ASAAS_API_KEY = os.environ.get("ASAAS_API_KEY")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 ASAAS_API = "https://api-sandbox.asaas.com/v3"
 
 PRODUCT_VALUE = 24.90
+
+# Nome EXATO do cliente criado no Asaas Sandbox
+ASAAS_CUSTOMER_NAME = "Teste bot Pix"
 
 
 def telegram(method, data):
@@ -23,7 +25,12 @@ def telegram(method, data):
         timeout=30
     )
 
-    print("TELEGRAM:", method, response.status_code, response.text)
+    print(
+        "TELEGRAM:",
+        method,
+        response.status_code,
+        response.text
+    )
 
     return response.json()
 
@@ -36,10 +43,57 @@ def asaas_headers():
     }
 
 
+def encontrar_cliente():
+    print("PROCURANDO CLIENTE NO ASAAS...")
+
+    response = requests.get(
+        f"{ASAAS_API}/customers",
+        headers=asaas_headers(),
+        params={
+            "name": ASAAS_CUSTOMER_NAME,
+            "limit": 100
+        },
+        timeout=30
+    )
+
+    print(
+        "ASAAS LIST CUSTOMERS:",
+        response.status_code,
+        response.text
+    )
+
+    if not response.ok:
+        return None
+
+    data = response.json()
+
+    clientes = data.get("data", [])
+
+    if not clientes:
+        print("CLIENTE NÃO ENCONTRADO")
+        return None
+
+    cliente = clientes[0]
+
+    print(
+        "CLIENTE ENCONTRADO:",
+        cliente.get("id")
+    )
+
+    return cliente.get("id")
+
+
 def criar_cobranca_pix():
+
+    customer_id = encontrar_cliente()
+
+    if not customer_id:
+        return None
+
     print("CRIANDO COBRANÇA ASAAS...")
 
     payload = {
+        "customer": customer_id,
         "billingType": "PIX",
         "value": PRODUCT_VALUE,
         "description": "Acesso Premium"
@@ -65,6 +119,7 @@ def criar_cobranca_pix():
 
 
 def obter_pix(payment_id):
+
     print("BUSCANDO QR CODE PIX...")
 
     response = requests.get(
@@ -98,10 +153,6 @@ def telegram_webhook():
     data = request.get_json(silent=True) or {}
 
     print("JSON:", data)
-
-    # =========================
-    # MENSAGEM NORMAL
-    # =========================
 
     if "message" in data:
 
@@ -137,10 +188,6 @@ def telegram_webhook():
                     "reply_markup": keyboard
                 }
             )
-
-    # =========================
-    # BOTÃO COMPRAR
-    # =========================
 
     if "callback_query" in data:
 
