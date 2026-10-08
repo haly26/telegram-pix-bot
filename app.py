@@ -1,5 +1,5 @@
 import os
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 import requests
 import psycopg2
@@ -19,11 +19,8 @@ ASAAS_API_KEY = os.getenv("ASAAS_API_KEY")
 ASAAS_WEBHOOK_TOKEN = os.getenv("ASAAS_WEBHOOK_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# PRODUÇÃO ASAAS
+# Asaas PRODUÇÃO
 ASAAS_API = "https://api.asaas.com/v3"
-
-# Cliente criado na conta PRODUÇÃO do Asaas
-ASAAS_CUSTOMER_NAME = "Cliente tele"
 
 # Produto
 PRODUCT_NAME = "ACESSO PREMIUM"
@@ -31,6 +28,9 @@ PRODUCT_VALUE = 24.90
 
 # Canal privado do Telegram
 CHANNEL_ID = -1004395341778
+
+# URL pública do bot
+BASE_URL = "https://telegram-pix-bot-hbii.onrender.com"
 
 
 # ============================================================
@@ -59,13 +59,16 @@ def get_db():
 
 
 def inicializar_banco():
+
     print("INICIALIZANDO BANCO DE DADOS...")
 
     conn = get_db()
 
     try:
+
         with conn.cursor() as cur:
 
+            # Mantém a tabela anterior para não perder histórico
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS payment_fulfillments (
                     payment_id TEXT PRIMARY KEY,
@@ -77,6 +80,18 @@ def inicializar_banco():
                 )
             """)
 
+            # Novo controle dos Checkouts
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS checkout_orders (
+                    checkout_id TEXT PRIMARY KEY,
+                    telegram_chat_id BIGINT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            # Idempotência dos webhooks
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS processed_events (
                     event_id TEXT PRIMARY KEY,
@@ -89,6 +104,7 @@ def inicializar_banco():
         print("BANCO DE DADOS PRONTO.")
 
     finally:
+
         conn.close()
 
 
@@ -100,7 +116,11 @@ inicializar_banco()
 # ============================================================
 
 def telegram_request(method, data):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/{method}"
+    )
 
     response = requests.post(
         url,
@@ -109,8 +129,11 @@ def telegram_request(method, data):
     )
 
     try:
+
         result = response.json()
+
     except Exception:
+
         result = {
             "ok": False,
             "description": response.text
@@ -124,7 +147,12 @@ def telegram_request(method, data):
     return result
 
 
-def enviar_mensagem(chat_id, texto, reply_markup=None):
+def enviar_mensagem(
+    chat_id,
+    texto,
+    reply_markup=None
+):
+
     data = {
         "chat_id": chat_id,
         "text": texto
@@ -133,7 +161,10 @@ def enviar_mensagem(chat_id, texto, reply_markup=None):
     if reply_markup:
         data["reply_markup"] = reply_markup
 
-    return telegram_request("sendMessage", data)
+    return telegram_request(
+        "sendMessage",
+        data
+    )
 
 
 # ============================================================
@@ -167,7 +198,10 @@ def enviar_menu(chat_id):
         "reply_markup": keyboard
     }
 
-    return telegram_request("sendMessage", data)
+    return telegram_request(
+        "sendMessage",
+        data
+    )
 
 
 # ============================================================
@@ -175,6 +209,7 @@ def enviar_menu(chat_id):
 # ============================================================
 
 def asaas_headers():
+
     return {
         "access_token": ASAAS_API_KEY,
         "Content-Type": "application/json",
@@ -182,155 +217,118 @@ def asaas_headers():
     }
 
 
-def buscar_cliente_asaas():
+# ============================================================
+# CRIAR CHECKOUT ASAAS
+# ============================================================
 
-    url = f"{ASAAS_API}/customers"
+def criar_checkout(chat_id):
 
-    params = {
-        "name": ASAAS_CUSTOMER_NAME,
-        "limit": 100
-    }
-
-    response = requests.get(
-        url,
-        headers=asaas_headers(),
-        params=params,
-        timeout=30
-    )
-
-    print(
-        "Busca cliente Asaas:",
-        response.status_code,
-        response.text
-    )
-
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-
-    customers = data.get("data", [])
-
-    for customer in customers:
-
-        if customer.get("name", "").strip().lower() == \
-                ASAAS_CUSTOMER_NAME.strip().lower():
-
-            return customer
-
-    return None
-
-
-def criar_cobranca_asaas(telegram_chat_id):
-
-    customer = buscar_cliente_asaas()
-
-    if not customer:
-        print(
-            f"ERRO: cliente '{ASAAS_CUSTOMER_NAME}' "
-            "não encontrado no Asaas."
-        )
-
-        return None
-
-    customer_id = customer["id"]
-
-    print(
-        "Cliente Asaas encontrado:",
-        customer_id,
-        customer.get("name")
+    # Identificador interno da venda
+    external_reference = (
+        f"telegram-{chat_id}-"
+        f"{int(datetime.utcnow().timestamp())}"
     )
 
     payload = {
-        "customer": customer_id,
-        "billingType": "PIX",
-        "value": PRODUCT_VALUE,
-        "dueDate": date.today().isoformat(),
-        "description": PRODUCT_NAME
+
+        # Somente PIX
+        "billingTypes": [
+            "PIX"
+        ],
+
+        # Pagamento avulso
+        "chargeTypes": [
+            "DETACHED"
+        ],
+
+        # Checkout válido por 60 minutos
+        "minutesToExpire": 60,
+
+        # Identificação da venda
+        "externalReference": external_reference,
+
+        # URLs de retorno.
+        # IMPORTANTE:
+        # elas NÃO confirmam o pagamento.
+        "callback": {
+            "successUrl": f"{BASE_URL}/checkout/sucesso",
+            "cancelUrl": f"{BASE_URL}/checkout/cancelado",
+            "expiredUrl": f"{BASE_URL}/checkout/expirado"
+        },
+
+        # Produto
+        "items": [
+            {
+                "name": PRODUCT_NAME,
+                "description": "Acesso ao conteúdo premium",
+                "quantity": 1,
+                "value": PRODUCT_VALUE
+            }
+        ]
+
+        # NÃO enviamos:
+        # customer
+        # customerData
+        #
+        # Dessa forma o próprio comprador
+        # preencherá seus dados no Checkout.
     }
 
     response = requests.post(
-        f"{ASAAS_API}/payments",
+        f"{ASAAS_API}/checkouts",
         headers=asaas_headers(),
         json=payload,
         timeout=30
     )
 
     print(
-        "Criação cobrança Asaas:",
+        "Criação Checkout Asaas:",
         response.status_code,
         response.text
     )
 
     if response.status_code not in (200, 201):
+
         return None
 
     return response.json()
 
 
-def obter_link_pagamento(payment_id):
-
-    response = requests.get(
-        f"{ASAAS_API}/payments/{payment_id}",
-        headers=asaas_headers(),
-        timeout=30
-    )
-
-    print(
-        "Consulta pagamento Asaas:",
-        response.status_code,
-        response.text
-    )
-
-    if response.status_code != 200:
-        return None
-
-    payment = response.json()
-
-    return payment.get("invoiceUrl")
-
-
 # ============================================================
-# CRIAR PIX
+# GERAR PAGAMENTO
 # ============================================================
 
-def criar_pix(chat_id):
+def criar_pagamento(chat_id):
 
-    payment = criar_cobranca_asaas(chat_id)
+    checkout = criar_checkout(chat_id)
 
-    if not payment:
+    if not checkout:
+
         enviar_mensagem(
             chat_id,
             "❌ Não foi possível gerar o pagamento agora.\n\n"
             "Tente novamente em alguns instantes."
         )
+
         return
 
-    payment_id = payment.get("id")
+    checkout_id = checkout.get("id")
 
-    if not payment_id:
-        enviar_mensagem(
-            chat_id,
-            "❌ O pagamento não pôde ser criado."
+    if not checkout_id:
+
+        print(
+            "Checkout retornado sem ID:",
+            checkout
         )
-        return
-
-    payment_link = payment.get("invoiceUrl")
-
-    if not payment_link:
-        payment_link = obter_link_pagamento(payment_id)
-
-    if not payment_link:
 
         enviar_mensagem(
             chat_id,
-            "❌ O link de pagamento não foi encontrado.\n\n"
-            "Tente novamente."
+            "❌ Não foi possível gerar o pagamento."
         )
 
         return
 
-    # Registra o pagamento no banco
+    # Registra o Checkout no banco
     conn = get_db()
 
     try:
@@ -338,19 +336,19 @@ def criar_pix(chat_id):
         with conn.cursor() as cur:
 
             cur.execute("""
-                INSERT INTO payment_fulfillments
+                INSERT INTO checkout_orders
                 (
-                    payment_id,
+                    checkout_id,
                     telegram_chat_id,
                     status
                 )
                 VALUES (%s, %s, %s)
-                ON CONFLICT (payment_id)
+                ON CONFLICT (checkout_id)
                 DO UPDATE SET
                     telegram_chat_id = EXCLUDED.telegram_chat_id,
                     updated_at = NOW()
             """, (
-                payment_id,
+                checkout_id,
                 chat_id,
                 "pending"
             ))
@@ -358,13 +356,23 @@ def criar_pix(chat_id):
         conn.commit()
 
     finally:
+
         conn.close()
+
+    # Link oficial do Checkout Asaas
+    checkout_url = (
+        "https://asaas.com/checkoutSession/show"
+        f"?id={checkout_id}"
+    )
 
     texto = (
         "💳 *PAGAMENTO GERADO*\n\n"
         f"Produto: *{PRODUCT_NAME}*\n"
         f"Valor: *R$ {PRODUCT_VALUE:.2f}*\n\n"
-        "Clique no botão abaixo para pagar via PIX.\n\n"
+        "Ao clicar abaixo, você será direcionado "
+        "para a página segura de pagamento.\n\n"
+        "📋 Seus dados serão preenchidos diretamente "
+        "no Checkout do Asaas.\n\n"
         "⚠️ Após a confirmação do pagamento, "
         "o acesso será enviado automaticamente aqui."
     )
@@ -374,7 +382,7 @@ def criar_pix(chat_id):
             [
                 {
                     "text": "💰 PAGAR PIX",
-                    "url": payment_link
+                    "url": checkout_url
                 }
             ]
         ]
@@ -391,47 +399,59 @@ def criar_pix(chat_id):
 # ENTREGAR ACESSO
 # ============================================================
 
-def processar_acesso(payment_id):
+def processar_acesso(
+    checkout_id,
+    chat_id
+):
 
     conn = get_db()
 
     try:
 
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor(
+            cursor_factory=RealDictCursor
+        ) as cur:
 
+            # Cria/obtém registro de entrega
             cur.execute("""
-                SELECT *
-                FROM payment_fulfillments
-                WHERE payment_id = %s
-                FOR UPDATE
-            """, (payment_id,))
+                INSERT INTO payment_fulfillments
+                (
+                    payment_id,
+                    telegram_chat_id,
+                    status
+                )
+                VALUES (%s, %s, %s)
+                ON CONFLICT (payment_id)
+                DO UPDATE SET
+                    telegram_chat_id = EXCLUDED.telegram_chat_id,
+                    updated_at = NOW()
+                RETURNING *
+            """, (
+                checkout_id,
+                chat_id,
+                "pending"
+            ))
 
             registro = cur.fetchone()
 
-            if not registro:
-
-                print(
-                    "Pagamento não encontrado no banco:",
-                    payment_id
-                )
-
-                return False
-
-            # Evita entregar o mesmo acesso duas vezes
+            # Se já foi entregue, não envia novamente
             if registro["status"] == "sent":
 
                 print(
-                    "Acesso já enviado para pagamento:",
-                    payment_id
+                    "Acesso já enviado:",
+                    checkout_id
                 )
+
+                conn.commit()
 
                 return True
 
-            chat_id = registro["telegram_chat_id"]
-
-            # Cria convite individual
+            # Convite válido por 24 horas
             expire_date = int(
-                (datetime.utcnow() + timedelta(days=1)).timestamp()
+                (
+                    datetime.utcnow()
+                    + timedelta(days=1)
+                ).timestamp()
             )
 
             invite_result = telegram_request(
@@ -450,9 +470,15 @@ def processar_acesso(payment_id):
                     invite_result
                 )
 
+                conn.rollback()
+
                 return False
 
-            invite_link = invite_result["result"]["invite_link"]
+            invite_link = (
+                invite_result
+                ["result"]
+                ["invite_link"]
+            )
 
             texto = (
                 "✅ *PAGAMENTO CONFIRMADO!*\n\n"
@@ -471,9 +497,11 @@ def processar_acesso(payment_id):
             if not telegram_result.get("ok"):
 
                 print(
-                    "Erro ao enviar acesso para o cliente:",
+                    "Erro ao enviar acesso:",
                     telegram_result
                 )
+
+                conn.rollback()
 
                 return False
 
@@ -487,14 +515,25 @@ def processar_acesso(payment_id):
             """, (
                 "sent",
                 invite_link,
-                payment_id
+                checkout_id
+            ))
+
+            cur.execute("""
+                UPDATE checkout_orders
+                SET
+                    status = %s,
+                    updated_at = NOW()
+                WHERE checkout_id = %s
+            """, (
+                "paid",
+                checkout_id
             ))
 
             conn.commit()
 
             print(
                 "ACESSO ENTREGUE COM SUCESSO:",
-                payment_id
+                checkout_id
             )
 
             return True
@@ -511,6 +550,7 @@ def processar_acesso(payment_id):
         return False
 
     finally:
+
         conn.close()
 
 
@@ -518,7 +558,10 @@ def processar_acesso(payment_id):
 # WEBHOOK ASAAS
 # ============================================================
 
-@app.route("/asaas", methods=["POST"])
+@app.route(
+    "/asaas",
+    methods=["POST"]
+)
 def webhook_asaas():
 
     received_token = request.headers.get(
@@ -527,7 +570,10 @@ def webhook_asaas():
 
     if received_token != ASAAS_WEBHOOK_TOKEN:
 
-        print("Webhook Asaas recusado: token inválido.")
+        print(
+            "Webhook Asaas recusado: "
+            "token inválido."
+        )
 
         return jsonify({
             "ok": False,
@@ -545,116 +591,212 @@ def webhook_asaas():
 
     event = data.get("event")
 
-    # Só nos interessa quando o pagamento foi realmente recebido
-    if event != "PAYMENT_RECEIVED":
+    event_id = data.get("id")
 
-        print(
-            "Evento ignorado:",
-            event
+    # ========================================================
+    # IDEMPOTÊNCIA
+    # ========================================================
+
+    if event_id:
+
+        conn = get_db()
+
+        try:
+
+            with conn.cursor() as cur:
+
+                cur.execute("""
+                    INSERT INTO processed_events
+                    (
+                        event_id
+                    )
+                    VALUES (%s)
+                    ON CONFLICT (event_id)
+                    DO NOTHING
+                    RETURNING event_id
+                """, (
+                    event_id,
+                ))
+
+                inserted = cur.fetchone()
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+        # Se já existia, ignora duplicata
+        if not inserted:
+
+            print(
+                "Evento já processado:",
+                event_id
+            )
+
+            return jsonify({
+                "ok": True
+            }), 200
+
+    # ========================================================
+    # CHECKOUT PAGO
+    # ========================================================
+
+    if event == "CHECKOUT_PAID":
+
+        checkout = data.get(
+            "checkout"
+        ) or {}
+
+        checkout_id = checkout.get(
+            "id"
         )
 
-        return jsonify({
-            "ok": True,
-            "ignored": True
-        }), 200
-
-    payment = data.get("payment") or {}
-
-    payment_id = payment.get("id")
-
-    if not payment_id:
-
-        print(
-            "Webhook sem payment.id"
+        checkout_status = checkout.get(
+            "status"
         )
 
-        return jsonify({
-            "ok": True
-        }), 200
-
-    payment_status = payment.get("status")
-
-    payment_value = payment.get("value")
-
-    print(
-        "Pagamento:",
-        payment_id,
-        "status:",
-        payment_status,
-        "valor:",
-        payment_value
-    )
-
-    # Segurança: somente RECEIVED
-    if payment_status != "RECEIVED":
-
         print(
-            "Pagamento ainda não está RECEIVED."
+            "CHECKOUT PAGO:",
+            checkout_id,
+            "status:",
+            checkout_status
         )
 
-        return jsonify({
-            "ok": True
-        }), 200
+        if not checkout_id:
 
-    # Segurança: confere valor
-    try:
-        payment_value = float(payment_value)
+            print(
+                "CHECKOUT_PAID sem checkout.id"
+            )
 
-    except Exception:
+            return jsonify({
+                "ok": True
+            }), 200
 
-        print(
-            "Valor do pagamento inválido."
-        )
+        if checkout_status != "PAID":
 
-        return jsonify({
-            "ok": True
-        }), 200
+            print(
+                "Checkout não está PAID."
+            )
 
-    if abs(payment_value - PRODUCT_VALUE) > 0.01:
+            return jsonify({
+                "ok": True
+            }), 200
 
-        print(
-            "VALOR DIFERENTE DO PRODUTO:",
-            payment_value
-        )
+        # Confere o valor do item
+        items = checkout.get(
+            "items"
+        ) or []
 
-        return jsonify({
-            "ok": True
-        }), 200
+        total = 0.0
 
-    # Processa e entrega o acesso
-    sucesso = processar_acesso(
-        payment_id
-    )
-
-    # Registra evento somente depois do processamento
-    if sucesso:
-
-        event_id = data.get("id")
-
-        if event_id:
-
-            conn = get_db()
+        for item in items:
 
             try:
 
-                with conn.cursor() as cur:
+                quantity = int(
+                    item.get(
+                        "quantity",
+                        1
+                    )
+                )
 
-                    cur.execute("""
-                        INSERT INTO processed_events
-                        (
-                            event_id
-                        )
-                        VALUES (%s)
-                        ON CONFLICT (event_id)
-                        DO NOTHING
-                    """, (
-                        event_id,
-                    ))
+                value = float(
+                    item.get(
+                        "value",
+                        0
+                    )
+                )
 
-                conn.commit()
+                total += quantity * value
 
-            finally:
-                conn.close()
+            except Exception:
+
+                pass
+
+        if abs(
+            total - PRODUCT_VALUE
+        ) > 0.01:
+
+            print(
+                "VALOR DO CHECKOUT DIFERENTE:",
+                total
+            )
+
+            return jsonify({
+                "ok": True
+            }), 200
+
+        # Recupera o chat do Telegram
+        conn = get_db()
+
+        try:
+
+            with conn.cursor(
+                cursor_factory=RealDictCursor
+            ) as cur:
+
+                cur.execute("""
+                    SELECT *
+                    FROM checkout_orders
+                    WHERE checkout_id = %s
+                """, (
+                    checkout_id,
+                ))
+
+                order = cur.fetchone()
+
+        finally:
+
+            conn.close()
+
+        if not order:
+
+            print(
+                "Checkout não encontrado no banco:",
+                checkout_id
+            )
+
+            return jsonify({
+                "ok": True
+            }), 200
+
+        chat_id = order[
+            "telegram_chat_id"
+        ]
+
+        processar_acesso(
+            checkout_id,
+            chat_id
+        )
+
+        return jsonify({
+            "ok": True
+        }), 200
+
+    # ========================================================
+    # EVENTOS ANTIGOS DE PAYMENT_RECEIVED
+    # ========================================================
+
+    if event == "PAYMENT_RECEIVED":
+
+        print(
+            "PAYMENT_RECEIVED recebido. "
+            "Para novos pedidos, o fluxo utiliza CHECKOUT_PAID."
+        )
+
+        return jsonify({
+            "ok": True
+        }), 200
+
+    # ========================================================
+    # OUTROS EVENTOS
+    # ========================================================
+
+    print(
+        "Evento Asaas ignorado:",
+        event
+    )
 
     return jsonify({
         "ok": True
@@ -665,7 +807,10 @@ def webhook_asaas():
 # WEBHOOK TELEGRAM
 # ============================================================
 
-@app.route("/telegram", methods=["POST"])
+@app.route(
+    "/telegram",
+    methods=["POST"]
+)
 def webhook_telegram():
 
     data = request.get_json(
@@ -677,29 +822,52 @@ def webhook_telegram():
         data
     )
 
-    message = data.get("message")
+    # ========================================================
+    # MENSAGEM
+    # ========================================================
+
+    message = data.get(
+        "message"
+    )
 
     if message:
 
-        chat = message.get("chat") or {}
+        chat = message.get(
+            "chat"
+        ) or {}
 
-        chat_id = chat.get("id")
+        chat_id = chat.get(
+            "id"
+        )
 
-        text = message.get("text", "")
+        text = message.get(
+            "text",
+            ""
+        )
 
         if chat_id and text:
 
-            if text.startswith("/start"):
+            if text.startswith(
+                "/start"
+            ):
 
-                enviar_menu(chat_id)
+                enviar_menu(
+                    chat_id
+                )
 
-    callback_query = data.get("callback_query")
+    # ========================================================
+    # BOTÃO
+    # ========================================================
+
+    callback_query = data.get(
+        "callback_query"
+    )
 
     if callback_query:
 
-        callback_id = callback_query.get("id")
-
-        from_user = callback_query.get("from") or {}
+        callback_id = callback_query.get(
+            "id"
+        )
 
         chat_id = (
             callback_query
@@ -712,19 +880,25 @@ def webhook_telegram():
             "data"
         )
 
-        # Remove o "loading" do botão
+        # Remove o carregamento do botão
         if callback_id:
 
             telegram_request(
                 "answerCallbackQuery",
                 {
-                    "callback_query_id": callback_id
+                    "callback_query_id":
+                        callback_id
                 }
             )
 
-        if callback_data == "comprar" and chat_id:
+        if (
+            callback_data == "comprar"
+            and chat_id
+        ):
 
-            criar_pix(chat_id)
+            criar_pagamento(
+                chat_id
+            )
 
     return jsonify({
         "ok": True
@@ -732,17 +906,65 @@ def webhook_telegram():
 
 
 # ============================================================
+# PÁGINAS DE RETORNO DO CHECKOUT
+# ============================================================
+
+@app.route(
+    "/checkout/sucesso",
+    methods=["GET"]
+)
+def checkout_sucesso():
+
+    return (
+        "Pagamento processado. "
+        "Se o pagamento foi confirmado, "
+        "o acesso será enviado automaticamente "
+        "pelo Telegram."
+    )
+
+
+@app.route(
+    "/checkout/cancelado",
+    methods=["GET"]
+)
+def checkout_cancelado():
+
+    return (
+        "Pagamento cancelado. "
+        "Você pode voltar ao Telegram "
+        "e gerar um novo pagamento."
+    )
+
+
+@app.route(
+    "/checkout/expirado",
+    methods=["GET"]
+)
+def checkout_expirado():
+
+    return (
+        "Este pagamento expirou. "
+        "Volte ao Telegram e gere um novo pagamento."
+    )
+
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 
-@app.route("/", methods=["GET"])
+@app.route(
+    "/",
+    methods=["GET"]
+)
 def home():
 
-    return "Telegram Pix Bot funcionando em PRODUÇÃO."
+    return (
+        "Telegram Pix Bot funcionando em PRODUÇÃO."
+    )
 
 
 # ============================================================
-# EXECUÇÃO LOCAL
+# EXECUÇÃO
 # ============================================================
 
 if __name__ == "__main__":
@@ -750,6 +972,9 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(
-            os.getenv("PORT", 5000)
+            os.getenv(
+                "PORT",
+                5000
+            )
         )
-    )
+        )
