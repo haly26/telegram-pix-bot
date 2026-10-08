@@ -1,9 +1,13 @@
 import os
 import requests
+import psycopg2
+
 from flask import Flask, request, jsonify
 from datetime import date, datetime, timedelta, timezone
 
+
 app = Flask(__name__)
+
 
 # ============================================================
 # CONFIGURAÇÕES
@@ -12,6 +16,7 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ASAAS_API_KEY = os.environ.get("ASAAS_API_KEY")
 ASAAS_WEBHOOK_TOKEN = os.environ.get("ASAAS_WEBHOOK_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -29,14 +34,102 @@ CHANNEL_ID = "-1004395341778"
 
 
 # ============================================================
-# PROTEÇÃO CONTRA DUPLICIDADE
+# BANCO DE DADOS
 # ============================================================
 
-# Eventos Asaas já processados nesta execução do servidor
-processed_events = set()
+def conectar_banco():
 
-# Cobranças que já receberam acesso nesta execução do servidor
-fulfilled_payments = set()
+    if not DATABASE_URL:
+
+        raise Exception(
+            "DATABASE_URL não configurada."
+        )
+
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        connect_timeout=10
+    )
+
+
+def inicializar_banco():
+
+    print(
+        "INICIALIZANDO BANCO DE DADOS..."
+    )
+
+    conn = None
+
+    try:
+
+        conn = conectar_banco()
+
+        cursor = conn.cursor()
+
+        # ====================================================
+        # TABELA DE PAGAMENTOS
+        # ====================================================
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payment_fulfillments (
+
+                payment_id TEXT PRIMARY KEY,
+
+                telegram_chat_id TEXT NOT NULL,
+
+                status TEXT NOT NULL DEFAULT 'pending',
+
+                invite_link TEXT,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+
+        # ====================================================
+        # TABELA DE EVENTOS ASAAS
+        # ====================================================
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_events (
+
+                event_id TEXT PRIMARY KEY,
+
+                processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+
+        conn.commit()
+
+        cursor.close()
+
+        print(
+            "BANCO DE DADOS PRONTO."
+        )
+
+    except Exception as erro:
+
+        print(
+            "ERRO AO INICIALIZAR BANCO:",
+            erro
+        )
+
+        if conn:
+
+            conn.rollback()
+
+        raise
+
+    finally:
+
+        if conn:
+
+            conn.close()
 
 
 # ============================================================
@@ -70,8 +163,11 @@ def telegram(method, data):
 def asaas_headers():
 
     return {
+
         "access_token": ASAAS_API_KEY,
+
         "Content-Type": "application/json",
+
         "Accept": "application/json"
     }
 
@@ -82,43 +178,63 @@ def asaas_headers():
 
 def encontrar_cliente():
 
-    print("PROCURANDO CLIENTE NO ASAAS...")
+    print(
+        "PROCURANDO CLIENTE NO ASAAS..."
+    )
 
     response = requests.get(
+
         f"{ASAAS_API}/customers",
+
         headers=asaas_headers(),
+
         params={
+
             "name": ASAAS_CUSTOMER_NAME,
+
             "limit": 100
         },
+
         timeout=30
     )
 
     print(
+
         "ASAAS LIST CUSTOMERS:",
+
         response.status_code,
+
         response.text
     )
 
     if not response.ok:
 
-        print("ERRO AO BUSCAR CLIENTE")
+        print(
+            "ERRO AO BUSCAR CLIENTE"
+        )
 
         return None
 
     data = response.json()
 
-    clientes = data.get("data", [])
+    clientes = data.get(
+        "data",
+        []
+    )
 
     if not clientes:
 
-        print("CLIENTE NÃO ENCONTRADO")
+        print(
+            "CLIENTE NÃO ENCONTRADO"
+        )
 
         return None
 
     cliente = clientes[0]
 
-    cliente_id = cliente.get("id")
+    cliente_id = cliente.get(
+        "id"
+    )
 
     print(
         "CLIENTE ENCONTRADO:",
@@ -140,7 +256,9 @@ def criar_cobranca_pix(chat_id):
 
         return None
 
-    print("CRIANDO COBRANÇA ASAAS...")
+    print(
+        "CRIANDO COBRANÇA ASAAS..."
+    )
 
     payload = {
 
@@ -154,20 +272,28 @@ def criar_cobranca_pix(chat_id):
 
         "dueDate": date.today().isoformat(),
 
-        # Identifica qual usuário Telegram gerou a cobrança
+        # Identifica qual usuário Telegram
+        # gerou a cobrança
         "externalReference": str(chat_id)
     }
 
     response = requests.post(
+
         f"{ASAAS_API}/payments",
+
         headers=asaas_headers(),
+
         json=payload,
+
         timeout=30
     )
 
     print(
+
         "ASAAS CREATE PAYMENT:",
+
         response.status_code,
+
         response.text
     )
 
@@ -184,17 +310,25 @@ def criar_cobranca_pix(chat_id):
 
 def obter_pix(payment_id):
 
-    print("BUSCANDO QR CODE PIX...")
+    print(
+        "BUSCANDO QR CODE PIX..."
+    )
 
     response = requests.get(
+
         f"{ASAAS_API}/payments/{payment_id}/pixQrCode",
+
         headers=asaas_headers(),
+
         timeout=30
     )
 
     print(
+
         "ASAAS PIX QR CODE:",
+
         response.status_code,
+
         response.text
     )
 
@@ -211,22 +345,32 @@ def obter_pix(payment_id):
 
 def criar_link_convite():
 
-    print("CRIANDO LINK DE CONVITE...")
+    print(
+        "CRIANDO LINK DE CONVITE..."
+    )
 
     # Link válido por 24 horas
     expiracao = int(
+
         (
+
             datetime.now(timezone.utc)
+
             + timedelta(hours=24)
+
         ).timestamp()
     )
 
     response = telegram(
+
         "createChatInviteLink",
+
         {
+
             "chat_id": CHANNEL_ID,
 
-            # Apenas uma pessoa pode entrar usando este link
+            # Apenas uma pessoa pode entrar
+            # usando este link
             "member_limit": 1,
 
             # Expira depois de 24 horas
@@ -240,7 +384,9 @@ def criar_link_convite():
     if not response.get("ok"):
 
         print(
+
             "ERRO AO CRIAR LINK:",
+
             response
         )
 
@@ -264,10 +410,400 @@ def criar_link_convite():
 
 
 # ============================================================
+# GARANTIR REGISTRO DO PAGAMENTO
+# ============================================================
+
+def criar_registro_pagamento(
+    payment_id,
+    telegram_chat_id
+):
+
+    conn = conectar_banco()
+
+    try:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+
+            """
+            INSERT INTO payment_fulfillments
+            (
+                payment_id,
+                telegram_chat_id,
+                status
+            )
+
+            VALUES
+            (
+                %s,
+                %s,
+                'pending'
+            )
+
+            ON CONFLICT (payment_id)
+            DO NOTHING
+            """,
+
+            (
+                payment_id,
+                str(telegram_chat_id)
+            )
+        )
+
+        conn.commit()
+
+        cursor.close()
+
+    finally:
+
+        conn.close()
+
+
+# ============================================================
+# PROCESSAR ACESSO
+# ============================================================
+
+def processar_acesso(
+    payment_id,
+    telegram_chat_id
+):
+
+    conn = conectar_banco()
+
+    try:
+
+        cursor = conn.cursor()
+
+        # ====================================================
+        # GARANTIR QUE O PAGAMENTO EXISTE
+        # ====================================================
+
+        cursor.execute(
+
+            """
+            INSERT INTO payment_fulfillments
+            (
+                payment_id,
+                telegram_chat_id,
+                status
+            )
+
+            VALUES
+            (
+                %s,
+                %s,
+                'pending'
+            )
+
+            ON CONFLICT (payment_id)
+            DO NOTHING
+            """,
+
+            (
+                payment_id,
+                str(telegram_chat_id)
+            )
+        )
+
+        conn.commit()
+
+        # ====================================================
+        # BLOQUEAR O REGISTRO
+        # ====================================================
+
+        cursor.execute(
+
+            """
+            SELECT
+                status,
+                invite_link,
+                telegram_chat_id
+
+            FROM payment_fulfillments
+
+            WHERE payment_id = %s
+
+            FOR UPDATE
+            """,
+
+            (
+                payment_id,
+            )
+        )
+
+        registro = cursor.fetchone()
+
+        if not registro:
+
+            print(
+                "ERRO: REGISTRO DO PAGAMENTO "
+                "NÃO ENCONTRADO."
+            )
+
+            conn.rollback()
+
+            return False
+
+        status = registro[0]
+
+        invite_link = registro[1]
+
+        telegram_chat_id_db = registro[2]
+
+        # ====================================================
+        # PAGAMENTO JÁ ENTREGUE
+        # ====================================================
+
+        if status == "sent":
+
+            print(
+                "PAGAMENTO JÁ ENTREGUE:",
+                payment_id
+            )
+
+            conn.commit()
+
+            return True
+
+        # ====================================================
+        # CRIAR LINK CASO AINDA NÃO EXISTA
+        # ====================================================
+
+        if not invite_link:
+
+            invite_link = criar_link_convite()
+
+            if not invite_link:
+
+                print(
+                    "NÃO FOI POSSÍVEL CRIAR "
+                    "O LINK DE CONVITE."
+                )
+
+                conn.rollback()
+
+                return False
+
+            # Salva o link imediatamente.
+            # Se o envio da mensagem falhar,
+            # podemos reutilizar o mesmo link.
+            cursor.execute(
+
+                """
+                UPDATE payment_fulfillments
+
+                SET
+                    invite_link = %s,
+                    status = 'ready',
+                    updated_at = NOW()
+
+                WHERE payment_id = %s
+                """,
+
+                (
+                    invite_link,
+                    payment_id
+                )
+            )
+
+        # ====================================================
+        # ENVIAR ACESSO
+        # ====================================================
+
+        resposta_telegram = telegram(
+
+            "sendMessage",
+
+            {
+
+                "chat_id": int(
+                    telegram_chat_id_db
+                ),
+
+                "text": (
+
+                    "✅ PAGAMENTO CONFIRMADO!\n\n"
+
+                    "Seu pagamento de "
+                    "R$ 24,90 foi recebido.\n\n"
+
+                    "🔓 SEU ACESSO PREMIUM:\n\n"
+
+                    f"{invite_link}\n\n"
+
+                    "⚠️ Este link é individual "
+                    "e pode ser usado para "
+                    "uma única entrada no canal.\n\n"
+
+                    "⏰ O link ficará disponível "
+                    "por 24 horas."
+                )
+            }
+        )
+
+        # ====================================================
+        # TELEGRAM ACEITOU
+        # ====================================================
+
+        if resposta_telegram.get("ok"):
+
+            cursor.execute(
+
+                """
+                UPDATE payment_fulfillments
+
+                SET
+                    status = 'sent',
+                    updated_at = NOW()
+
+                WHERE payment_id = %s
+                """,
+
+                (
+                    payment_id,
+                )
+            )
+
+            conn.commit()
+
+            print(
+                "ACESSO ENTREGUE COM SUCESSO:",
+                payment_id
+            )
+
+            return True
+
+        # ====================================================
+        # TELEGRAM RECUSOU
+        # ====================================================
+
+        print(
+            "TELEGRAM NÃO ACEITOU "
+            "A MENSAGEM."
+        )
+
+        conn.rollback()
+
+        return False
+
+    except Exception as erro:
+
+        print(
+            "ERRO AO PROCESSAR ACESSO:",
+            erro
+        )
+
+        conn.rollback()
+
+        return False
+
+    finally:
+
+        cursor.close()
+
+        conn.close()
+
+
+# ============================================================
+# REGISTRAR EVENTO PROCESSADO
+# ============================================================
+
+def registrar_evento(event_id):
+
+    if not event_id:
+
+        return
+
+    conn = conectar_banco()
+
+    try:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+
+            """
+            INSERT INTO processed_events
+            (
+                event_id
+            )
+
+            VALUES
+            (
+                %s
+            )
+
+            ON CONFLICT (event_id)
+            DO NOTHING
+            """,
+
+            (
+                event_id,
+            )
+        )
+
+        conn.commit()
+
+        cursor.close()
+
+    finally:
+
+        conn.close()
+
+
+# ============================================================
+# VERIFICAR EVENTO JÁ PROCESSADO
+# ============================================================
+
+def evento_ja_processado(event_id):
+
+    if not event_id:
+
+        return False
+
+    conn = conectar_banco()
+
+    try:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+
+            """
+            SELECT 1
+
+            FROM processed_events
+
+            WHERE event_id = %s
+
+            LIMIT 1
+            """,
+
+            (
+                event_id,
+            )
+        )
+
+        resultado = cursor.fetchone()
+
+        cursor.close()
+
+        return resultado is not None
+
+    finally:
+
+        conn.close()
+
+
+# ============================================================
 # PÁGINA PRINCIPAL
 # ============================================================
 
-@app.route("/", methods=["GET"])
+@app.route(
+    "/",
+    methods=["GET"]
+)
 def home():
 
     return "BOT ONLINE - ASAAS"
@@ -277,7 +813,10 @@ def home():
 # WEBHOOK TELEGRAM
 # ============================================================
 
-@app.route("/telegram", methods=["POST"])
+@app.route(
+    "/telegram",
+    methods=["POST"]
+)
 def telegram_webhook():
 
     print(
@@ -321,22 +860,27 @@ def telegram_webhook():
                     [
 
                         {
-                            "text": "💳 COMPRAR — R$ 24,90",
 
-                            "callback_data": "comprar"
+                            "text":
+                            "💳 COMPRAR — R$ 24,90",
+
+                            "callback_data":
+                            "comprar"
                         }
 
                     ]
 
                 ]
-
             }
 
             telegram(
+
                 "sendMessage",
+
                 {
 
-                    "chat_id": chat_id,
+                    "chat_id":
+                    chat_id,
 
                     "text": (
 
@@ -351,10 +895,10 @@ def telegram_webhook():
                         "realizar o pagamento:"
                     ),
 
-                    "reply_markup": keyboard
+                    "reply_markup":
+                    keyboard
                 }
             )
-
 
     # ========================================================
     # CLIQUE NO BOTÃO COMPRAR
@@ -384,8 +928,11 @@ def telegram_webhook():
 
         # Remove o "carregando" do botão
         telegram(
+
             "answerCallbackQuery",
+
             {
+
                 "callback_query_id":
                 callback_id
             }
@@ -408,10 +955,13 @@ def telegram_webhook():
             if cobranca is None:
 
                 telegram(
+
                     "sendMessage",
+
                     {
 
-                        "chat_id": chat_id,
+                        "chat_id":
+                        chat_id,
 
                         "text": (
 
@@ -446,10 +996,13 @@ def telegram_webhook():
                 if pix is None:
 
                     telegram(
+
                         "sendMessage",
+
                         {
 
-                            "chat_id": chat_id,
+                            "chat_id":
+                            chat_id,
 
                             "text": (
 
@@ -486,12 +1039,16 @@ def telegram_webhook():
                     )
 
                     telegram(
+
                         "sendMessage",
+
                         {
 
-                            "chat_id": chat_id,
+                            "chat_id":
+                            chat_id,
 
-                            "text": mensagem
+                            "text":
+                            mensagem
                         }
                     )
 
@@ -506,7 +1063,10 @@ def telegram_webhook():
 # WEBHOOK ASAAS
 # ============================================================
 
-@app.route("/asaas", methods=["POST"])
+@app.route(
+    "/asaas",
+    methods=["POST"]
+)
 def asaas_webhook():
 
     print(
@@ -582,33 +1142,31 @@ def asaas_webhook():
     )
 
     # ========================================================
-    # PROTEÇÃO 1
-    # EVENTO JÁ PROCESSADO?
+    # EVENTO JÁ PROCESSADO
     # ========================================================
 
-    if event_id:
+    if event_id and evento_ja_processado(
+        event_id
+    ):
 
-        if event_id in processed_events:
+        print(
+            "EVENTO JÁ PROCESSADO."
+        )
 
-            print(
-                "EVENTO DUPLICADO!"
-            )
+        print(
+            "EVENTO IGNORADO:",
+            event_id
+        )
 
-            print(
-                "EVENTO IGNORADO:",
-                event_id
-            )
-
-            # Retorna 200 para o Asaas
-            return jsonify(
-                {
-                    "ok": True,
-                    "duplicate": True
-                }
-            )
+        return jsonify(
+            {
+                "ok": True,
+                "duplicate": True
+            }
+        )
 
     # ========================================================
-    # SÓ PROCESSAR PAGAMENTO RECEBIDO
+    # SÓ PROCESSAR PAYMENT_RECEIVED
     # ========================================================
 
     if evento != "PAYMENT_RECEIVED":
@@ -620,7 +1178,7 @@ def asaas_webhook():
 
         if event_id:
 
-            processed_events.add(
+            registrar_evento(
                 event_id
             )
 
@@ -651,6 +1209,10 @@ def asaas_webhook():
         "status"
     )
 
+    payment_value = payment.get(
+        "value"
+    )
+
     print(
         "PAGAMENTO RECEBIDO:",
         payment_id
@@ -662,12 +1224,17 @@ def asaas_webhook():
     )
 
     print(
+        "VALOR:",
+        payment_value
+    )
+
+    print(
         "TELEGRAM CHAT ID:",
         telegram_chat_id
     )
 
     # ========================================================
-    # VALIDAR ID DA COBRANÇA
+    # VALIDAR ID
     # ========================================================
 
     if not payment_id:
@@ -679,34 +1246,6 @@ def asaas_webhook():
         return jsonify(
             {
                 "ok": True
-            }
-        )
-
-    # ========================================================
-    # PROTEÇÃO 2
-    # COBRANÇA JÁ ENTREGUE?
-    # ========================================================
-
-    if payment_id in fulfilled_payments:
-
-        print(
-            "COBRANÇA JÁ PROCESSADA!"
-        )
-
-        print(
-            "ACESSO NÃO SERÁ GERADO NOVAMENTE."
-        )
-
-        if event_id:
-
-            processed_events.add(
-                event_id
-            )
-
-        return jsonify(
-            {
-                "ok": True,
-                "already_fulfilled": True
             }
         )
 
@@ -748,20 +1287,70 @@ def asaas_webhook():
         )
 
     # ========================================================
-    # CRIAR LINK DE CONVITE
+    # CONFIRMAR VALOR
     # ========================================================
 
-    invite_link = criar_link_convite()
+    try:
 
-    if not invite_link:
-
-        print(
-            "ERRO: NÃO FOI POSSÍVEL "
-            "CRIAR LINK"
+        valor = float(
+            payment_value
         )
 
-        # Não marcamos como processado,
-        # permitindo uma nova tentativa
+    except:
+
+        print(
+            "VALOR DO PAGAMENTO INVÁLIDO."
+        )
+
+        return jsonify(
+            {
+                "ok": True
+            }
+        )
+
+    if abs(
+        valor - PRODUCT_VALUE
+    ) > 0.01:
+
+        print(
+            "VALOR DIFERENTE DO PRODUTO."
+        )
+
+        print(
+            "ESPERADO:",
+            PRODUCT_VALUE
+        )
+
+        print(
+            "RECEBIDO:",
+            valor
+        )
+
+        return jsonify(
+            {
+                "ok": True
+            }
+        )
+
+    # ========================================================
+    # ENTREGAR ACESSO
+    # ========================================================
+
+    sucesso = processar_acesso(
+
+        payment_id,
+
+        telegram_chat_id
+    )
+
+    if not sucesso:
+
+        print(
+            "FALHA AO ENTREGAR ACESSO."
+        )
+
+        # Retornamos erro para o Asaas
+        # tentar novamente.
         return jsonify(
             {
                 "ok": False
@@ -769,80 +1358,17 @@ def asaas_webhook():
         ), 500
 
     # ========================================================
-    # ENVIAR ACESSO PARA O CLIENTE
+    # MARCAR EVENTO COMO PROCESSADO
     # ========================================================
-
-    resposta_telegram = telegram(
-        "sendMessage",
-        {
-
-            "chat_id": int(
-                telegram_chat_id
-            ),
-
-            "text": (
-
-                "✅ PAGAMENTO CONFIRMADO!\n\n"
-
-                "Seu pagamento de "
-                "R$ 24,90 foi recebido.\n\n"
-
-                "🔓 SEU ACESSO PREMIUM:\n\n"
-
-                f"{invite_link}\n\n"
-
-                "⚠️ Este link é individual "
-                "e pode ser usado para "
-                "uma única entrada no canal.\n\n"
-
-                "⏰ O link ficará disponível "
-                "por 24 horas."
-            )
-        }
-    )
-
-    # ========================================================
-    # VERIFICAR SE TELEGRAM ACEITOU A MENSAGEM
-    # ========================================================
-
-    if not resposta_telegram.get(
-        "ok"
-    ):
-
-        print(
-            "ERRO AO ENVIAR ACESSO "
-            "PARA O TELEGRAM."
-        )
-
-        return jsonify(
-            {
-                "ok": False
-            }
-        ), 500
-
-    # ========================================================
-    # MARCAR COMO PROCESSADO
-    # ========================================================
-
-    fulfilled_payments.add(
-        payment_id
-    )
 
     if event_id:
 
-        processed_events.add(
+        registrar_evento(
             event_id
         )
 
     print(
-        "ACESSO ENVIADO PARA:",
-        telegram_chat_id
-    )
-
-    print(
-        "PAGAMENTO MARCADO COMO "
-        "PROCESSADO:",
-        payment_id
+        "WEBHOOK PROCESSADO COM SUCESSO."
     )
 
     return jsonify(
@@ -853,12 +1379,30 @@ def asaas_webhook():
 
 
 # ============================================================
+# INICIALIZAÇÃO
+# ============================================================
+
+try:
+
+    inicializar_banco()
+
+except Exception as erro:
+
+    print(
+        "AVISO: BANCO NÃO PÔDE SER "
+        "INICIALIZADO:",
+        erro
+    )
+
+
+# ============================================================
 # INICIAR SERVIDOR
 # ============================================================
 
 if __name__ == "__main__":
 
     port = int(
+
         os.environ.get(
             "PORT",
             10000
@@ -866,6 +1410,8 @@ if __name__ == "__main__":
     )
 
     app.run(
+
         host="0.0.0.0",
+
         port=port
-    )
+        )
