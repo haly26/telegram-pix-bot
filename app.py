@@ -9,104 +9,75 @@ import requests
 import psycopg2
 from flask import Flask, request, jsonify
 
-# ============================================================
-# CONFIGURACOES
-# ============================================================
-
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
 ASAAS_API_KEY = os.getenv("ASAAS_API_KEY")
 ASAAS_WEBHOOK_TOKEN = os.getenv("ASAAS_WEBHOOK_TOKEN")
-
 FLOWINPAY_API_KEY = os.getenv("FLOWINPAY_API_KEY")
 FLOWINPAY_WEBHOOK_SECRET = os.getenv("FLOWINPAY_WEBHOOK_SECRET")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Mantem Asaas como padrao ate a FlowinPay ser testada.
-# Para trocar depois, configure PAYMENT_PROVIDER=flowinpay no Render.
-PAYMENT_PROVIDER = os.getenv(
-    "PAYMENT_PROVIDER", "asaas"
-).strip().lower()
+PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "asaas").lower().strip()
 
 ASAAS_API = "https://api.asaas.com/v3"
 FLOWINPAY_API = "https://app.flowinpay.com.br/api/v1"
 
-BASE_URL = "https://telegram-pix-bot-hbii.onrender.com"
-
 CHANNEL_ID = -1004395341778
-
 PRODUCT_NAME = "ACESSO PREMIUM"
 PRODUCT_VALUE = 24.90
-
 ASAAS_CUSTOMER_NAME = "Cliente tele"
 
 
 # ============================================================
-# BANCO DE DADOS
+# BANCO
 # ============================================================
 
 def get_db():
     if not DATABASE_URL:
         raise Exception("DATABASE_URL nao configurada.")
-
     return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
-    print("INICIALIZANDO BANCO DE DADOS...")
-
     conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS payment_fulfillments (
-            payment_id TEXT PRIMARY KEY,
-            telegram_chat_id BIGINT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            invite_link TEXT,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS processed_events (
-            event_id TEXT PRIMARY KEY,
-            processed_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    print("BANCO DE DADOS PRONTO.")
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS payment_fulfillments (
+                payment_id TEXT PRIMARY KEY,
+                telegram_chat_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                invite_link TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_events (
+                event_id TEXT PRIMARY KEY,
+                processed_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        cur.close()
+        print("BANCO DE DADOS PRONTO.")
+    finally:
+        conn.close()
 
 
 def registrar_pagamento(payment_id, chat_id):
-    """Salva a relacao entre uma cobranca e o comprador do Telegram."""
-
     conn = get_db()
-
     try:
         cur = conn.cursor()
-
         cur.execute("""
             INSERT INTO payment_fulfillments
                 (payment_id, telegram_chat_id, status)
             VALUES (%s, %s, 'pending')
-            ON CONFLICT (payment_id)
-            DO UPDATE SET
-                telegram_chat_id = EXCLUDED.telegram_chat_id,
-                updated_at = NOW()
+            ON CONFLICT (payment_id) DO NOTHING
         """, (str(payment_id), chat_id))
-
         conn.commit()
         cur.close()
-
     finally:
         conn.close()
 
@@ -119,26 +90,19 @@ def telegram_request(method, payload):
     if not TELEGRAM_TOKEN:
         raise Exception("TELEGRAM_TOKEN nao configurado.")
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-
     response = requests.post(
-        url,
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
         json=payload,
-        timeout=30
+        timeout=25
     )
 
     try:
         data = response.json()
     except Exception:
-        data = {
-            "ok": False,
-            "description": response.text
-        }
+        data = {"ok": False, "description": response.text}
 
-    print(
-        f"TELEGRAM {method}: "
-        f"HTTP {response.status_code} - {data}"
-    )
+    if response.status_code >= 400 or not data.get("ok"):
+        raise Exception(f"Erro Telegram {method}: {data}")
 
     return data
 
@@ -149,491 +113,307 @@ def enviar_mensagem(chat_id, texto, reply_markup=None):
         "text": texto,
         "parse_mode": "HTML"
     }
-
     if reply_markup:
         payload["reply_markup"] = reply_markup
-
     return telegram_request("sendMessage", payload)
 
 
-def responder_callback(callback_query_id):
+def responder_callback(callback_id):
     return telegram_request(
         "answerCallbackQuery",
-        {"callback_query_id": callback_query_id}
+        {"callback_query_id": callback_id}
     )
 
 
 # ============================================================
-# REQUISICOES ASAAS
+# CLIENTE HTTP DOS GATEWAYS
 # ============================================================
 
 def asaas_request(method, endpoint, payload=None):
     if not ASAAS_API_KEY:
         raise Exception("ASAAS_API_KEY nao configurada.")
 
-    url = f"{ASAAS_API}{endpoint}"
-
-    headers = {
-        "access_token": ASAAS_API_KEY,
-        "Content-Type": "application/json",
-        "User-Agent": "TelegramPixBot/1.0"
-    }
-
-    try:
-        if method == "GET":
-            response = requests.get(
-                url, headers=headers, timeout=30
-            )
-        elif method == "POST":
-            response = requests.post(
-                url, headers=headers, json=payload, timeout=30
-            )
-        elif method == "PUT":
-            response = requests.put(
-                url, headers=headers, json=payload, timeout=30
-            )
-        else:
-            raise Exception(f"Metodo HTTP nao suportado: {method}")
-
-    except Exception as e:
-        print(f"ERRO DE CONEXAO ASAAS: {e}")
-        raise
-
-    try:
-        data = response.json()
-    except Exception:
-        data = {"errors": [{"description": response.text}]}
-
-    print(
-        f"ASAAS {method} {endpoint}: "
-        f"HTTP {response.status_code}"
+    response = requests.request(
+        method,
+        f"{ASAAS_API}{endpoint}",
+        headers={
+            "access_token": ASAAS_API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": "TelegramPixBot/1.0"
+        },
+        json=payload,
+        timeout=25
     )
-
-    if response.status_code >= 400:
-        raise Exception(
-            f"Asaas HTTP {response.status_code}: {data}"
-        )
-
-    return data
-
-
-# ============================================================
-# REQUISICOES FLOWINPAY
-# ============================================================
-
-def flowinpay_request(method, endpoint, payload=None):
-    if not FLOWINPAY_API_KEY:
-        raise Exception("FLOWINPAY_API_KEY nao configurada.")
-
-    url = f"{FLOWINPAY_API}{endpoint}"
-
-    headers = {
-        "X-Api-Key": FLOWINPAY_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-
-    try:
-        if method == "GET":
-            response = requests.get(
-                url, headers=headers, timeout=20
-            )
-        elif method == "POST":
-            response = requests.post(
-                url, headers=headers, json=payload, timeout=20
-            )
-        else:
-            raise Exception(
-                f"Metodo HTTP FlowinPay nao suportado: {method}"
-            )
-
-    except Exception as e:
-        print(f"ERRO DE CONEXAO FLOWINPAY: {e}")
-        raise
 
     try:
         data = response.json()
     except Exception:
         data = {"message": response.text}
 
-    # Nao registrar a chave da API nos logs.
-    print(
-        f"FLOWINPAY {method} {endpoint}: "
-        f"HTTP {response.status_code}"
-    )
+    print(f"ASAAS {method} {endpoint}: HTTP {response.status_code}")
 
     if response.status_code >= 400:
-        raise Exception(
-            f"FlowinPay HTTP {response.status_code}: {data}"
-        )
+        raise Exception(f"Asaas HTTP {response.status_code}: {data}")
+    return data
 
+
+def flowinpay_request(method, endpoint, payload=None):
+    if not FLOWINPAY_API_KEY:
+        raise Exception("FLOWINPAY_API_KEY nao configurada.")
+
+    response = requests.request(
+        method,
+        f"{FLOWINPAY_API}{endpoint}",
+        headers={
+            "X-Api-Key": FLOWINPAY_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        },
+        json=payload,
+        timeout=25
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"message": response.text}
+
+    print(f"FLOWINPAY {method} {endpoint}: HTTP {response.status_code}")
+
+    if response.status_code >= 400:
+        raise Exception(f"FlowinPay HTTP {response.status_code}: {data}")
     return data
 
 
 # ============================================================
-# ASAAS: LOCALIZAR CLIENTE
+# CRIAR COBRANCAS
 # ============================================================
 
 def localizar_cliente_asaas():
     data = asaas_request("GET", "/customers?limit=100")
-
     for cliente in data.get("data", []):
-        nome = (cliente.get("name") or "").strip().lower()
+        if (cliente.get("name") or "").strip().lower() == ASAAS_CUSTOMER_NAME.lower():
+            return cliente["id"]
+    raise Exception(f"Cliente '{ASAAS_CUSTOMER_NAME}' nao encontrado no Asaas.")
 
-        if nome == ASAAS_CUSTOMER_NAME.lower():
-            customer_id = cliente.get("id")
-            print(f"CLIENTE ASAAS ENCONTRADO: {customer_id}")
-            return customer_id
-
-    raise Exception(
-        f"Cliente '{ASAAS_CUSTOMER_NAME}' nao encontrado no Asaas."
-    )
-
-
-# ============================================================
-# CRIAR COBRANCA ASAAS
-# ============================================================
 
 def criar_cobranca_asaas(chat_id):
     customer_id = localizar_cliente_asaas()
-
-    external_reference = (
-        f"telegram-{chat_id}-{int(time.time())}"
-    )
-
     payload = {
         "customer": customer_id,
         "billingType": "PIX",
         "value": PRODUCT_VALUE,
         "dueDate": date.today().isoformat(),
         "description": PRODUCT_NAME,
-        "externalReference": external_reference
+        "externalReference": f"telegram-{chat_id}-{int(time.time())}"
     }
-
     pagamento = asaas_request("POST", "/payments", payload)
 
-    payment_id = pagamento.get("id")
+    if not pagamento.get("id") or not pagamento.get("invoiceUrl"):
+        raise Exception("Resposta incompleta do Asaas.")
 
-    if not payment_id:
-        raise Exception("Asaas nao retornou o ID da cobranca.")
+    registrar_pagamento(pagamento["id"], chat_id)
+    return str(pagamento["id"]), pagamento["invoiceUrl"]
 
-    registrar_pagamento(payment_id, chat_id)
-
-    return pagamento
-
-
-# ============================================================
-# CRIAR COBRANCA FLOWINPAY
-# ============================================================
 
 def criar_cobranca_flowinpay(chat_id):
-    """
-    Cria cobranca FlowinPay e registra o ID antes de enviar
-    o link ao comprador.
-
-    O prefixo flowinpay- evita colisao com IDs do Asaas.
-    """
-
-    payload = {
+    resposta = flowinpay_request("POST", "/charges", {
         "value": PRODUCT_VALUE,
         "description": PRODUCT_NAME
-    }
-
-    resposta = flowinpay_request(
-        "POST",
-        "/charges",
-        payload
-    )
+    })
 
     cobranca = resposta.get("charge", resposta)
-
     charge_id = cobranca.get("id")
     payment_link = cobranca.get("payment_link_url")
 
-    if charge_id is None:
-        raise Exception("FlowinPay nao retornou o ID da cobranca.")
-
-    if not payment_link:
-        raise Exception(
-            "FlowinPay nao retornou payment_link_url."
-        )
+    if charge_id is None or not payment_link:
+        raise Exception("FlowinPay nao retornou ID e link da cobranca.")
 
     payment_id = f"flowinpay-{charge_id}"
-
-    # Salvar antes de enviar o link ao cliente.
     registrar_pagamento(payment_id, chat_id)
 
-    print(
-        f"COBRANCA FLOWINPAY CRIADA: "
-        f"{payment_id} | CHAT: {chat_id}"
-    )
-
-    return {
-        "id": payment_id,
-        "invoiceUrl": payment_link
-    }
+    print(f"COBRANCA FLOWINPAY CRIADA: {payment_id}")
+    return payment_id, payment_link
 
 
 # ============================================================
-# BOTAO COMPRAR
+# MENU E COMPRA
 # ============================================================
 
 def mostrar_produto(chat_id):
-    keyboard = {
-        "inline_keyboard": [[
-            {
-                "text": "💰 COMPRAR — R$ 24,90",
-                "callback_data": "comprar"
-            }
-        ]]
-    }
-
-    texto = (
+    enviar_mensagem(
+        chat_id,
         f"<b>{PRODUCT_NAME}</b>\n\n"
-        f"💰 Valor: <b>R$ 24,90</b>\n\n"
-        "Clique abaixo para gerar seu pagamento PIX."
+        f"💰 Valor: <b>R$ {PRODUCT_VALUE:.2f}</b>\n\n"
+        "Clique abaixo para gerar seu pagamento PIX.",
+        {"inline_keyboard": [[{
+            "text": "💰 COMPRAR — R$ 24,90",
+            "callback_data": "comprar"
+        }]]}
     )
 
-    enviar_mensagem(chat_id, texto, keyboard)
-
-
-# ============================================================
-# PROCESSAR COMPRA
-# ============================================================
 
 def processar_compra(chat_id):
     try:
         if PAYMENT_PROVIDER == "flowinpay":
-            pagamento = criar_cobranca_flowinpay(chat_id)
-
+            payment_id, invoice_url = criar_cobranca_flowinpay(chat_id)
         elif PAYMENT_PROVIDER == "asaas":
-            pagamento = criar_cobranca_asaas(chat_id)
-
+            payment_id, invoice_url = criar_cobranca_asaas(chat_id)
         else:
-            raise Exception(
-                "PAYMENT_PROVIDER invalido. Use asaas ou flowinpay."
-            )
-
-        payment_id = pagamento.get("id")
-        invoice_url = pagamento.get("invoiceUrl")
-
-        if not invoice_url:
-            raise Exception("Nao foi retornado o link de pagamento.")
-
-        keyboard = {
-            "inline_keyboard": [[
-                {
-                    "text": "💰 PAGAR PIX — R$ 24,90",
-                    "url": invoice_url
-                }
-            ]]
-        }
-
-        texto = (
-            "✅ <b>Pagamento gerado!</b>\n\n"
-            "Valor: <b>R$ 24,90</b>\n"
-            "Forma de pagamento: <b>PIX</b>\n\n"
-            "Clique no botao abaixo para realizar o pagamento.\n\n"
-            "⚠️ Apos a confirmacao do pagamento, "
-            "seu acesso sera liberado automaticamente."
-        )
-
-        enviar_mensagem(chat_id, texto, keyboard)
-
-        print(
-            f"COBRANCA CRIADA: "
-            f"{payment_id} | CHAT: {chat_id} | "
-            f"PROVEDOR: {PAYMENT_PROVIDER}"
-        )
-
-    except Exception as e:
-        print(f"ERRO AO CRIAR COBRANCA: {e}")
+            raise Exception("PAYMENT_PROVIDER deve ser asaas ou flowinpay.")
 
         enviar_mensagem(
             chat_id,
-            "❌ Nao foi possivel gerar o pagamento agora.\n\n"
+            "✅ <b>Pagamento gerado!</b>\n\n"
+            "Valor: <b>R$ 24,90</b>\n"
+            "Forma de pagamento: <b>PIX</b>\n\n"
+            "Clique abaixo para pagar. Seu acesso será liberado "
+            "após a confirmação.",
+            {"inline_keyboard": [[{
+                "text": "💰 PAGAR PIX — R$ 24,90",
+                "url": invoice_url
+            }]]}
+        )
+        print(f"COBRANCA CRIADA: {payment_id}; provedor={PAYMENT_PROVIDER}")
+
+    except Exception as e:
+        print(f"ERRO AO CRIAR COBRANCA: {e}")
+        enviar_mensagem(
+            chat_id,
+            "❌ Não foi possível gerar o pagamento agora. "
             "Tente novamente em alguns instantes."
         )
 
 
 # ============================================================
-# CRIAR LINK DE CONVITE DO TELEGRAM
+# VALIDAR PAGAMENTOS
+# ============================================================
+
+def validar_pagamento_asaas(payment_id):
+    pagamento = asaas_request("GET", f"/payments/{payment_id}")
+    try:
+        value = float(pagamento.get("value", 0))
+    except (ValueError, TypeError):
+        return False
+
+    return (
+        pagamento.get("status") == "RECEIVED"
+        and round(value, 2) == round(PRODUCT_VALUE, 2)
+    )
+
+
+def validar_pagamento_flowinpay(charge_id):
+    resposta = flowinpay_request("GET", f"/charges/{charge_id}")
+    cobranca = resposta.get("charge", resposta)
+
+    try:
+        value = float(cobranca.get("value", 0))
+    except (ValueError, TypeError):
+        return False
+
+    return (
+        str(cobranca.get("status", "")).lower() == "paid"
+        and round(value, 2) == round(PRODUCT_VALUE, 2)
+    )
+
+
+# ============================================================
+# CONVITE E ENTREGA IDEMPOTENTE
 # ============================================================
 
 def criar_link_convite():
     expire_timestamp = int(
         (datetime.utcnow() + timedelta(hours=24)).timestamp()
     )
-
-    payload = {
+    result = telegram_request("createChatInviteLink", {
         "chat_id": CHANNEL_ID,
         "member_limit": 1,
         "expire_date": expire_timestamp
-    }
+    })
+    return result["result"]["invite_link"]
 
-    resultado = telegram_request(
-        "createChatInviteLink",
-        payload
-    )
-
-    if not resultado.get("ok"):
-        raise Exception(f"Erro ao criar convite: {resultado}")
-
-    return resultado["result"]["invite_link"]
-
-
-# ============================================================
-# ENTREGAR ACESSO
-# ============================================================
 
 def processar_acesso(payment_id):
-    conn = get_db()
-    cur = conn.cursor()
+    """
+    Bloqueia a linha do pedido durante a entrega para que dois
+    webhooks simultaneos nao entreguem dois convites.
+    """
 
+    conn = get_db()
     try:
+        cur = conn.cursor()
         cur.execute("""
             SELECT telegram_chat_id, status, invite_link
             FROM payment_fulfillments
             WHERE payment_id = %s
+            FOR UPDATE
         """, (str(payment_id),))
-
         row = cur.fetchone()
 
         if not row:
-            print(f"PAGAMENTO {payment_id} NAO ENCONTRADO NO BANCO.")
-            return
+            conn.rollback()
+            print(f"PEDIDO NAO ENCONTRADO: {payment_id}")
+            return False
 
         chat_id, status, existing_invite = row
 
-        # Evita enviar novamente um convite ja entregue.
         if status == "sent" and existing_invite:
-            print(f"ACESSO JA ENTREGUE PARA {payment_id}.")
-            return
+            conn.commit()
+            print(f"ACESSO JA ENTREGUE: {payment_id}")
+            return True
 
-        invite_link = criar_link_convite()
-
-        texto = (
-            "🎉 <b>Pagamento confirmado!</b>\n\n"
-            "Seu acesso ao conteudo premium foi liberado.\n\n"
-            "👇 <b>CLIQUE ABAIXO PARA ENTRAR:</b>"
-        )
-
-        keyboard = {
-            "inline_keyboard": [[
-                {
+        # Manter a linha bloqueada durante a entrega impede
+        # que outro processo entregue o mesmo pedido em paralelo.
+        try:
+            invite_link = criar_link_convite()
+            resultado = enviar_mensagem(
+                chat_id,
+                "🎉 <b>Pagamento confirmado!</b>\n\n"
+                "Seu acesso ao conteúdo premium foi liberado.\n\n"
+                "👇 <b>CLIQUE ABAIXO PARA ENTRAR:</b>",
+                {"inline_keyboard": [[{
                     "text": "🔐 ENTRAR NO CANAL PREMIUM",
                     "url": invite_link
-                }
-            ]]
-        }
-
-        resultado = enviar_mensagem(
-            chat_id, texto, keyboard
-        )
-
-        if not resultado.get("ok"):
-            raise Exception(
-                f"Telegram nao confirmou o envio: {resultado}"
+                }]]}
             )
 
-        cur.execute("""
-            UPDATE payment_fulfillments
-            SET status = 'sent',
-                invite_link = %s,
-                updated_at = NOW()
-            WHERE payment_id = %s
-        """, (invite_link, str(payment_id)))
+            if not resultado.get("ok"):
+                raise Exception("Telegram nao confirmou a mensagem.")
 
-        conn.commit()
+            cur.execute("""
+                UPDATE payment_fulfillments
+                SET status = 'sent',
+                    invite_link = %s,
+                    updated_at = NOW()
+                WHERE payment_id = %s
+            """, (invite_link, str(payment_id)))
+            conn.commit()
+            print(f"ACESSO ENTREGUE: {payment_id}")
+            return True
 
-        print(
-            f"ACESSO ENTREGUE: "
-            f"PAYMENT={payment_id} CHAT={chat_id}"
-        )
+        except Exception:
+            conn.rollback()
+            raise
 
     except Exception as e:
-        conn.rollback()
-        print(
-            f"ERRO AO ENTREGAR ACESSO: {payment_id} - {e}"
-        )
-
-        cur.execute("""
-            UPDATE payment_fulfillments
-            SET status = 'error', updated_at = NOW()
-            WHERE payment_id = %s
-        """, (str(payment_id),))
-
-        conn.commit()
+        print(f"ERRO AO ENTREGAR ACESSO {payment_id}: {e}")
+        # Registra falha fora da transacao que foi revertida.
+        try:
+            cur2 = conn.cursor()
+            cur2.execute("""
+                UPDATE payment_fulfillments
+                SET status = 'error', updated_at = NOW()
+                WHERE payment_id = %s AND status <> 'sent'
+            """, (str(payment_id),))
+            conn.commit()
+            cur2.close()
+        except Exception as db_error:
+            conn.rollback()
+            print(f"ERRO AO REGISTRAR FALHA: {db_error}")
+        raise
 
     finally:
-        cur.close()
         conn.close()
-
-
-# ============================================================
-# VALIDAR PAGAMENTO ASAAS
-# ============================================================
-
-def validar_pagamento_asaas(payment_id):
-    pagamento = asaas_request(
-        "GET", f"/payments/{payment_id}"
-    )
-
-    status = pagamento.get("status")
-    value = float(pagamento.get("value", 0))
-
-    print(
-        f"VALIDACAO ASAAS: {payment_id} | "
-        f"STATUS={status} | VALOR={value}"
-    )
-
-    if status != "RECEIVED":
-        return False
-
-    if round(value, 2) != round(PRODUCT_VALUE, 2):
-        print("ASAAS: VALOR INCORRETO.")
-        return False
-
-    return True
-
-
-# ============================================================
-# VALIDAR PAGAMENTO FLOWINPAY
-# ============================================================
-
-def validar_pagamento_flowinpay(charge_id):
-    """
-    Consulta a cobranca diretamente na FlowinPay.
-    O webhook, sozinho, nao e suficiente para liberar acesso.
-    """
-
-    resposta = flowinpay_request(
-        "GET", f"/charges/{charge_id}"
-    )
-
-    cobranca = resposta.get("charge", resposta)
-
-    status = str(cobranca.get("status", "")).lower()
-
-    try:
-        value = float(cobranca.get("value", 0))
-    except (TypeError, ValueError):
-        value = 0.0
-
-    print(
-        f"VALIDACAO FLOWINPAY: {charge_id} | "
-        f"STATUS={status} | VALOR={value}"
-    )
-
-    if status != "paid":
-        print("FLOWINPAY: PAGAMENTO AINDA NAO ESTA PAGO.")
-        return False
-
-    if round(value, 2) != round(PRODUCT_VALUE, 2):
-        print("FLOWINPAY: VALOR INCORRETO.")
-        return False
-
-    return True
 
 
 # ============================================================
@@ -642,72 +422,31 @@ def validar_pagamento_flowinpay(charge_id):
 
 @app.route("/asaas", methods=["POST"])
 def asaas_webhook():
-    received_token = request.headers.get(
-        "asaas-access-token"
-    )
-
     if not ASAAS_WEBHOOK_TOKEN:
-        print("ASAAS_WEBHOOK_TOKEN nao configurado.")
         return jsonify({"error": "Webhook token not configured"}), 500
 
-    if received_token != ASAAS_WEBHOOK_TOKEN:
-        print("WEBHOOK ASAAS: TOKEN INVALIDO.")
+    received_token = request.headers.get("asaas-access-token", "")
+    if not hmac.compare_digest(received_token, ASAAS_WEBHOOK_TOKEN):
         return jsonify({"error": "Unauthorized"}), 401
 
     body = request.get_json(silent=True) or {}
-
-    event_id = body.get("id")
     event_type = body.get("event")
     payment = body.get("payment") or {}
     payment_id = payment.get("id")
 
-    print(
-        f"WEBHOOK ASAAS: EVENT={event_type} "
-        f"EVENT_ID={event_id} PAYMENT={payment_id}"
-    )
+    print(f"WEBHOOK ASAAS: EVENT={event_type} PAYMENT={payment_id}")
 
-    if not event_id:
-        return jsonify({"received": True}), 200
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("""
-            SELECT event_id FROM processed_events
-            WHERE event_id = %s
-        """, (event_id,))
-
-        if cur.fetchone():
-            return jsonify({"received": True}), 200
-
-        cur.execute("""
-            INSERT INTO processed_events (event_id)
-            VALUES (%s)
-            ON CONFLICT (event_id) DO NOTHING
-        """, (event_id,))
-
-        conn.commit()
-
-    finally:
-        cur.close()
-        conn.close()
-
-    if event_type != "PAYMENT_RECEIVED":
-        return jsonify({"received": True}), 200
-
-    if not payment_id:
+    if event_type != "PAYMENT_RECEIVED" or not payment_id:
         return jsonify({"received": True}), 200
 
     try:
         if not validar_pagamento_asaas(payment_id):
             return jsonify({"received": True}), 200
-
+        if not processar_acesso(str(payment_id)):
+            return jsonify({"error": "Order not found"}), 500
     except Exception as e:
-        print(f"ERRO AO VALIDAR ASAAS {payment_id}: {e}")
-        return jsonify({"error": "payment validation failed"}), 500
-
-    processar_acesso(payment_id)
+        print(f"ERRO WEBHOOK ASAAS: {e}")
+        return jsonify({"error": "Processing failed"}), 500
 
     return jsonify({"received": True}), 200
 
@@ -722,9 +461,7 @@ def flowinpay_webhook():
         print("FLOWINPAY_WEBHOOK_SECRET nao configurado.")
         return jsonify({"error": "Webhook secret not configured"}), 500
 
-    # Validar a assinatura usando o corpo original da requisicao.
     raw_body = request.get_data(cache=True)
-
     received_signature = request.headers.get(
         "X-FlowinPay-Signature", ""
     ).strip()
@@ -742,78 +479,63 @@ def flowinpay_webhook():
         return jsonify({"error": "Unauthorized"}), 401
 
     body = request.get_json(silent=True) or {}
-
     event_type = (
         body.get("event")
         or request.headers.get("event")
         or request.headers.get("X-FlowinPay-Event")
     )
-
     charge = body.get("charge") or {}
     charge_id = charge.get("id")
 
-    print(
-        f"WEBHOOK FLOWINPAY: EVENT={event_type} "
-        f"CHARGE={charge_id}"
-    )
+    print(f"WEBHOOK FLOWINPAY: EVENT={event_type} CHARGE={charge_id}")
 
-    # Somente pagamento confirmado pode liberar acesso.
+    # O evento de teste nao representa um pagamento.
+    if event_type == "webhook.test":
+        return jsonify({"received": True}), 200
+
     if event_type != "charge.completed":
         return jsonify({"received": True}), 200
 
     if charge_id is None:
         print("WEBHOOK FLOWINPAY SEM ID DA COBRANCA.")
-        return jsonify({"received": True}), 200
+        return jsonify({"error": "Missing charge ID"}), 400
 
     payment_id = f"flowinpay-{charge_id}"
 
-    # Confere se essa cobranca foi criada pelo nosso bot.
-    conn = get_db()
-    cur = conn.cursor()
-
     try:
-        cur.execute("""
-            SELECT status
-            FROM payment_fulfillments
-            WHERE payment_id = %s
-        """, (payment_id,))
+        # Confirma que a cobranca pertence a um pedido do bot.
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM payment_fulfillments WHERE payment_id = %s",
+                (payment_id,)
+            )
+            exists = cur.fetchone() is not None
+            cur.close()
+        finally:
+            conn.close()
 
-        row = cur.fetchone()
+        if not exists:
+            print(f"COBRANCA SEM PEDIDO REGISTRADO: {payment_id}")
+            return jsonify({"error": "Order not found"}), 404
 
-    finally:
-        cur.close()
-        conn.close()
+        if not validar_pagamento_flowinpay(charge_id):
+            print(f"PAGAMENTO FLOWINPAY NAO VALIDADO: {payment_id}")
+            return jsonify({"error": "Payment not confirmed"}), 409
 
-    if not row:
-        print(
-            f"COBRANCA FLOWINPAY NAO PERTENCE A UM PEDIDO "
-            f"REGISTRADO: {payment_id}"
-        )
-        return jsonify({"received": True}), 200
-
-    # Consulta a API antes de liberar o canal.
-    try:
-        pagamento_valido = validar_pagamento_flowinpay(
-            charge_id
-        )
-
-        if not pagamento_valido:
-            return jsonify({"received": True}), 200
+        if not processar_acesso(payment_id):
+            return jsonify({"error": "Delivery failed"}), 500
 
     except Exception as e:
-        print(
-            f"ERRO AO VALIDAR FLOWINPAY {charge_id}: {e}"
-        )
-        # HTTP 500 permite que a FlowinPay tente novamente.
-        return jsonify({"error": "payment validation failed"}), 500
-
-    processar_acesso(payment_id)
+        print(f"ERRO WEBHOOK FLOWINPAY: {e}")
+        return jsonify({"error": "Processing failed"}), 500
 
     return jsonify({"received": True}), 200
 
 
 # ============================================================
-# PAGINA INICIAL / STATUS
+# STATUS E TELEGRAM
 # ============================================================
 
 @app.route("/", methods=["GET"])
@@ -821,62 +543,41 @@ def home():
     return "Telegram PIX Bot funcionando em PRODUCAO.", 200
 
 
-# ============================================================
-# WEBHOOK TELEGRAM
-# ============================================================
-
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
 
-    print("TELEGRAM WEBHOOK RECEBIDO.")
-
-    # Mensagens normais
     message = update.get("message")
-
     if message:
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         text = message.get("text", "")
 
-        if not chat_id:
-            return jsonify({"ok": True}), 200
-
-        if text.startswith("/start"):
+        if chat_id and text.startswith("/start"):
             mostrar_produto(chat_id)
-            return jsonify({"ok": True}), 200
+        return jsonify({"ok": True}), 200
 
-    # Cliques nos botoes
-    callback_query = update.get("callback_query")
-
-    if callback_query:
-        callback_id = callback_query.get("id")
-        callback_data = callback_query.get("data", "")
-
-        callback_message = (
-            callback_query.get("message") or {}
-        )
-
-        callback_chat = (
-            callback_message.get("chat") or {}
-        )
-
-        chat_id = callback_chat.get("id")
-
+    callback = update.get("callback_query")
+    if callback:
+        callback_id = callback.get("id")
         if callback_id:
-            responder_callback(callback_id)
+            try:
+                responder_callback(callback_id)
+            except Exception as e:
+                print(f"ERRO CALLBACK: {e}")
 
-        if callback_data == "comprar" and chat_id:
+        data = callback.get("data", "")
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+
+        if data == "comprar" and chat_id:
             processar_compra(chat_id)
 
         return jsonify({"ok": True}), 200
 
     return jsonify({"ok": True}), 200
 
-
-# ============================================================
-# INICIALIZACAO
-# ============================================================
 
 try:
     init_db()
