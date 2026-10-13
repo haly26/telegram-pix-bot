@@ -274,11 +274,11 @@ def obter_status_membro(chat_id):
 
 
 def garantir_acesso_telegram(chat_id, expires_at, renewal=False):
-    try:
-        member_status = obter_status_membro(chat_id)
-    except Exception as e:
-        print(f"NAO FOI POSSIVEL CONSULTAR MEMBRO {chat_id}: {e}")
-        member_status = "unknown"
+    # Nunca enviar convite se a consulta ao Telegram falhar: isso evita liberar
+    # acesso sem saber o estado real do membro.
+    member_status = obter_status_membro(chat_id)
+    if member_status == "unknown":
+        raise Exception("Estado do membro desconhecido; acesso nao foi alterado.")
 
     if member_status in ("member", "administrator", "creator"):
         texto = ("✅ <b>Renovação confirmada!</b>\n\n" if renewal else "✅ <b>Pagamento confirmado!</b>\n\n")
@@ -288,6 +288,8 @@ def garantir_acesso_telegram(chat_id, expires_at, renewal=False):
 
     if member_status == "kicked":
         telegram_request("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": chat_id, "only_if_banned": True})
+    elif member_status not in ("left",):
+        raise Exception(f"Estado inesperado do membro no Telegram: {member_status}")
 
     invite = criar_link_convite()
     texto = ("🎉 <b>Renovação confirmada!</b>\n\n" if renewal else "🎉 <b>Pagamento confirmado!</b>\n\n")
@@ -297,13 +299,15 @@ def garantir_acesso_telegram(chat_id, expires_at, renewal=False):
     conn = db_connect()
     try:
         cur = conn.cursor()
-        cur.execute("UPDATE subscriptions SET current_invite_link = %s, updated_at = NOW() WHERE telegram_chat_id = %s", (invite, chat_id))
+        cur.execute(
+            "UPDATE subscriptions SET current_invite_link = %s, updated_at = NOW() WHERE telegram_chat_id = %s AND status = 'active'",
+            (invite, chat_id)
+        )
         conn.commit()
         cur.close()
     finally:
         conn.close()
     return invite
-
 
 def processar_acesso(payment_id):
     """Aplica cada pagamento uma única vez; entrega pode ser tentada novamente."""
@@ -383,111 +387,198 @@ def processar_webhook_pagamento(provider, payment_id):
 def criar_ou_reutilizar_cobranca_renovacao(chat_id, expires_at):
     if PAYMENT_PROVIDER != "flowinpay":
         raise Exception("A rotina automatica de renovacao esta configurada para FlowinPay. Confirme o provedor antes de usar Asaas.")
+
     key_expiry = expires_at.astimezone(timezone.utc).isoformat()
     renewal_key = f"renewal:{chat_id}:{key_expiry}"
+    # Lock de sessao impede duas execucoes de criarem a mesma cobranca ao mesmo tempo.
     conn = db_connect()
+    lock_key = None
     try:
         cur = conn.cursor()
-        cur.execute("SELECT payment_link, payment_id FROM payment_fulfillments WHERE renewal_key = %s", (renewal_key,))
+        cur.execute("SELECT pg_advisory_lock(hashtext(%s))", (renewal_key,))
+        lock_key = renewal_key
+        cur.execute(
+            "SELECT payment_link, payment_id FROM payment_fulfillments WHERE renewal_key = %s",
+            (renewal_key,)
+        )
         existing = cur.fetchone()
-        cur.close()
-    finally:
-        conn.close()
-    if existing and existing[0]:
-        return existing[0], existing[1]
-    # Uma rotina Cron única deve ser usada; isso evita dois processos simultâneos criando a mesma renovação.
-    payment_id, payment_link = criar_cobranca_flowinpay(chat_id, renewal_key=renewal_key)
-    return payment_link, payment_id
+        if existing and existing[0]:
+            return existing[0], existing[1]
 
+        # A trava permanece ativa durante a chamada externa e o registro no banco.
+        payment_id, payment_link = criar_cobranca_flowinpay(chat_id, renewal_key=renewal_key)
+        return payment_link, payment_id
+    finally:
+        if lock_key is not None:
+            try:
+                cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
+            except Exception:
+                pass
+        try:
+            cur.close()
+        except Exception:
+            pass
+        conn.close()
 
 def executar_rotina_diaria():
-    now = utcnow()
-    conn = db_connect()
+    # Uma trava global impede que dois Cron Jobs trabalhem nas mesmas assinaturas.
+    lock_conn = db_connect()
+    lock_cur = lock_conn.cursor()
+    lock_cur.execute("SELECT pg_try_advisory_lock(hashtext('telegram_subscription_daily_job'))")
+    got_lock = lock_cur.fetchone()[0]
+    if not got_lock:
+        print("ROTINA JA ESTA EM EXECUCAO; esta instancia sera encerrada.")
+        lock_cur.close()
+        lock_conn.close()
+        return
+
     try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT telegram_chat_id, expires_at, status, current_invite_link, reminder_3d_sent, reminder_due_sent FROM subscriptions WHERE status = 'active' ORDER BY expires_at")
-        subscriptions = cur.fetchall()
-        cur.close()
-    finally:
-        conn.close()
-
-    for sub in subscriptions:
-        chat_id = sub["telegram_chat_id"]
-        expiry = sub["expires_at"]
-        if expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=timezone.utc)
+        now = utcnow()
+        conn = db_connect()
         try:
-            if expiry > now and expiry <= now + timedelta(days=3) and not sub["reminder_3d_sent"]:
-                link, payment_id = criar_ou_reutilizar_cobranca_renovacao(chat_id, expiry)
-                enviar_mensagem(chat_id,
-                    "⏳ <b>Sua assinatura VIP está perto de vencer!</b>\n\n"
-                    f"Vencimento: <b>{expiry.strftime('%d/%m/%Y %H:%M UTC')}</b>\n"
-                    "Renove agora para continuar com acesso sem interrupção.\n\n"
-                    "💰 Valor: <b>R$ 24,90 por mais 30 dias</b>",
-                    {"inline_keyboard": [[{"text": "🔄 RENOVAR AGORA — R$ 24,90", "url": link}]]})
-                conn2 = db_connect()
-                try:
-                    c2 = conn2.cursor()
-                    c2.execute("UPDATE subscriptions SET reminder_3d_sent = TRUE, updated_at = NOW() WHERE telegram_chat_id = %s AND expires_at = %s AND reminder_3d_sent = FALSE", (chat_id, expiry))
-                    conn2.commit()
-                    c2.close()
-                finally:
-                    conn2.close()
-                print(f"LEMBRETE 3 DIAS ENVIADO: {chat_id}; {payment_id}")
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute("""
+                SELECT telegram_chat_id, expires_at, status, current_invite_link,
+                       reminder_3d_sent, reminder_due_sent
+                FROM subscriptions
+                WHERE status = 'active'
+                ORDER BY expires_at
+            """)
+            subscriptions = cur.fetchall()
+            cur.close()
+        finally:
+            conn.close()
 
-            if now >= expiry and now <= expiry + timedelta(hours=GRACE_HOURS) and not sub["reminder_due_sent"]:
-                link, payment_id = criar_ou_reutilizar_cobranca_renovacao(chat_id, expiry)
-                enviar_mensagem(chat_id,
-                    "⚠️ <b>Sua assinatura VIP vence hoje/está vencida.</b>\n\n"
-                    "Você tem até 24 horas após o vencimento para renovar antes da remoção automática do canal.\n\n"
-                    "💰 Renovação por mais 30 dias: <b>R$ 24,90</b>",
-                    {"inline_keyboard": [[{"text": "🔄 RENOVAR AGORA — R$ 24,90", "url": link}]]})
-                conn2 = db_connect()
-                try:
-                    c2 = conn2.cursor()
-                    c2.execute("UPDATE subscriptions SET reminder_due_sent = TRUE, updated_at = NOW() WHERE telegram_chat_id = %s AND expires_at = %s AND reminder_due_sent = FALSE", (chat_id, expiry))
-                    conn2.commit()
-                    c2.close()
-                finally:
-                    conn2.close()
-                print(f"LEMBRETE VENCIMENTO ENVIADO: {chat_id}; {payment_id}")
+        for sub in subscriptions:
+            chat_id = sub["telegram_chat_id"]
+            expiry = sub["expires_at"]
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
 
-            if now > expiry + timedelta(hours=GRACE_HOURS):
-                # Só marca como expirado depois de concluir a remoção; se falhar, o Cron tenta novamente.
-                conn2 = db_connect()
-                try:
-                    c2 = conn2.cursor()
-                    c2.execute("SELECT status FROM subscriptions WHERE telegram_chat_id = %s AND expires_at = %s FOR UPDATE", (chat_id, expiry))
-                    state_row = c2.fetchone()
-                    conn2.commit()
-                    c2.close()
-                finally:
-                    conn2.close()
-                if state_row and state_row[0] == 'active':
-                    if sub["current_invite_link"]:
-                        try:
-                            telegram_request("revokeChatInviteLink", {"chat_id": CHANNEL_ID, "invite_link": sub["current_invite_link"]})
-                        except Exception as e:
-                            print(f"AVISO: nao foi possivel revogar convite {chat_id}: {e}")
+            try:
+                if expiry > now and expiry <= now + timedelta(days=3) and not sub["reminder_3d_sent"]:
+                    link, payment_id = criar_ou_reutilizar_cobranca_renovacao(chat_id, expiry)
+                    enviar_mensagem(
+                        chat_id,
+                        "⏳ <b>Sua assinatura VIP está perto de vencer!</b>\n\n"
+                        f"Vencimento: <b>{expiry.strftime('%d/%m/%Y %H:%M UTC')}</b>\n"
+                        "Renove agora para continuar com acesso sem interrupção.\n\n"
+                        "💰 Valor: <b>R$ 24,90 por mais 30 dias</b>",
+                        {"inline_keyboard": [[{"text": "🔄 RENOVAR AGORA — R$ 24,90", "url": link}]]}
+                    )
+                    conn2 = db_connect()
                     try:
-                        telegram_request("banChatMember", {"chat_id": CHANNEL_ID, "user_id": chat_id, "revoke_messages": False})
-                        telegram_request("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": chat_id, "only_if_banned": True})
-                        # Banir e desbanir remove a pessoa, mas permite que volte com um novo convite.
-                        enviar_mensagem(chat_id, "⛔ Sua assinatura VIP expirou e o acesso ao canal foi encerrado. Para voltar, renove pelo bot usando /start.")
-                        conn3 = db_connect()
-                        try:
-                            c3 = conn3.cursor()
-                            c3.execute("UPDATE subscriptions SET status = 'expired', updated_at = NOW() WHERE telegram_chat_id = %s AND expires_at = %s AND status = 'active'", (chat_id, expiry))
-                            conn3.commit()
-                            c3.close()
-                        finally:
-                            conn3.close()
-                        print(f"ASSINATURA EXPIRADA/ACESSO REMOVIDO: {chat_id}")
-                    except Exception as e:
-                        print(f"ERRO AO REMOVER ASSINANTE {chat_id}; o Cron tentara novamente: {e}")
-        except Exception as e:
-            print(f"ERRO NA ROTINA DIARIA PARA {chat_id}: {e}")
+                        c2 = conn2.cursor()
+                        c2.execute("""
+                            UPDATE subscriptions SET reminder_3d_sent = TRUE, updated_at = NOW()
+                            WHERE telegram_chat_id = %s AND expires_at = %s
+                              AND status = 'active' AND reminder_3d_sent = FALSE
+                        """, (chat_id, expiry))
+                        conn2.commit()
+                        c2.close()
+                    finally:
+                        conn2.close()
+                    print(f"LEMBRETE 3 DIAS ENVIADO: {chat_id}; {payment_id}")
 
+                # Esta condição abrange o vencimento até completar as 24 horas de tolerância.
+                if expiry <= now <= expiry + timedelta(hours=GRACE_HOURS) and not sub["reminder_due_sent"]:
+                    link, payment_id = criar_ou_reutilizar_cobranca_renovacao(chat_id, expiry)
+                    enviar_mensagem(
+                        chat_id,
+                        "⚠️ <b>Sua assinatura VIP venceu.</b>\n\n"
+                        "Você tem até 24 horas após o vencimento para renovar antes da remoção automática do canal.\n\n"
+                        "💰 Renovação por mais 30 dias: <b>R$ 24,90</b>",
+                        {"inline_keyboard": [[{"text": "🔄 RENOVAR AGORA — R$ 24,90", "url": link}]]}
+                    )
+                    conn2 = db_connect()
+                    try:
+                        c2 = conn2.cursor()
+                        c2.execute("""
+                            UPDATE subscriptions SET reminder_due_sent = TRUE, updated_at = NOW()
+                            WHERE telegram_chat_id = %s AND expires_at = %s
+                              AND status = 'active' AND reminder_due_sent = FALSE
+                        """, (chat_id, expiry))
+                        conn2.commit()
+                        c2.close()
+                    finally:
+                        conn2.close()
+                    print(f"LEMBRETE VENCIMENTO ENVIADO: {chat_id}; {payment_id}")
+
+                if now > expiry + timedelta(hours=GRACE_HOURS):
+                    # Mantém o lock da assinatura até concluir a remoção. Se houver
+                    # pagamento simultâneo, a renovação espera e reativa o acesso depois.
+                    conn2 = db_connect()
+                    try:
+                        c2 = conn2.cursor()
+                        c2.execute("""
+                            SELECT status, expires_at, current_invite_link
+                            FROM subscriptions
+                            WHERE telegram_chat_id = %s
+                            FOR UPDATE
+                        """, (chat_id,))
+                        current = c2.fetchone()
+                        if not current:
+                            conn2.rollback()
+                            continue
+
+                        current_status, current_expiry, current_invite = current
+                        if current_expiry.tzinfo is None:
+                            current_expiry = current_expiry.replace(tzinfo=timezone.utc)
+
+                        # Não remove se a assinatura foi renovada ou já processada.
+                        if (current_status != "active"
+                                or current_expiry != expiry
+                                or utcnow() <= current_expiry + timedelta(hours=GRACE_HOURS)):
+                            conn2.rollback()
+                            continue
+
+                        if current_invite:
+                            try:
+                                telegram_request("revokeChatInviteLink", {
+                                    "chat_id": CHANNEL_ID,
+                                    "invite_link": current_invite
+                                })
+                            except Exception as e:
+                                print(f"AVISO: nao foi possivel revogar convite {chat_id}: {e}")
+
+                        telegram_request("banChatMember", {
+                            "chat_id": CHANNEL_ID,
+                            "user_id": chat_id,
+                            "revoke_messages": False
+                        })
+                        telegram_request("unbanChatMember", {
+                            "chat_id": CHANNEL_ID,
+                            "user_id": chat_id,
+                            "only_if_banned": True
+                        })
+                        c2.execute("""
+                            UPDATE subscriptions SET status = 'expired', current_invite_link = NULL,
+                                updated_at = NOW()
+                            WHERE telegram_chat_id = %s AND expires_at = %s AND status = 'active'
+                        """, (chat_id, expiry))
+                        conn2.commit()
+                        print(f"ASSINATURA EXPIRADA/ACESSO REMOVIDO: {chat_id}")
+                        try:
+                            enviar_mensagem(
+                                chat_id,
+                                "⛔ Sua assinatura VIP expirou e o acesso ao canal foi encerrado. Para voltar, renove pelo bot usando /start."
+                            )
+                        except Exception as e:
+                            print(f"AVISO: nao foi possivel avisar expiracao {chat_id}: {e}")
+                    except Exception:
+                        conn2.rollback()
+                        raise
+                    finally:
+                        conn2.close()
+
+            except Exception as e:
+                print(f"ERRO NA ROTINA DIARIA PARA {chat_id}: {e}")
+    finally:
+        try:
+            lock_cur.execute("SELECT pg_advisory_unlock(hashtext('telegram_subscription_daily_job'))")
+        finally:
+            lock_cur.close()
+            lock_conn.close()
 
 @app.route("/diagnostico-flowinpay", methods=["GET"])
 def diagnostico_flowinpay():
@@ -612,10 +703,9 @@ def telegram_webhook():
     return jsonify({"ok": True}), 200
 
 
-try:
-    init_db()
-except Exception as e:
-    print(f"ERRO AO INICIALIZAR BANCO: {e}")
+# Falha explicitamente se o banco nao estiver acessivel. Assim, o worker nao
+# aparenta concluir a rotina quando a inicializacao do banco falha.
+init_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
